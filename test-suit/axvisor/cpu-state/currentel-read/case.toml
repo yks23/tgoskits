@@ -1,0 +1,7 @@
+id = "cpu.currentel.read"
+interface = "privileged-control-register-currentel"
+arch = ["aarch64"]
+timeout_secs = 5
+
+[compare]
+mode = "strong"

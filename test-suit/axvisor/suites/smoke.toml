@@ -1,0 +1,7 @@
+name = "axvisor-smoke"
+
+[arches.aarch64]
+cases = [
+  "cpu-state/currentel-read",
+  "cpu-state/mpidr-read",
+]

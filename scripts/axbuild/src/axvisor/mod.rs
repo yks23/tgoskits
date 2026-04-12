@@ -15,13 +15,14 @@ pub mod build;
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod diff;
 pub mod image;
 pub mod qemu;
 pub mod qemu_test;
 
 pub use cli::{
-    ArgsBoard, ArgsBuild, ArgsConfig, ArgsDefconfig, ArgsQemu, ArgsTest, ArgsUboot, Command,
-    ConfigCommand, TestCommand,
+    ArgsBoard, ArgsBuild, ArgsConfig, ArgsDefconfig, ArgsQemu, ArgsTest, ArgsTestDiff, ArgsUboot,
+    Command, ConfigCommand, TestCommand,
 };
 
 pub struct Axvisor {
@@ -126,7 +127,14 @@ impl Axvisor {
             TestCommand::Qemu(args) => self.test_qemu(args).await,
             TestCommand::Uboot(args) => self.test_uboot(args).await,
             TestCommand::Board(args) => self.test_board(args).await,
+            TestCommand::Diff(args) => self.test_diff(args).await,
         }
+    }
+
+    async fn test_diff(&mut self, args: cli::ArgsTestDiff) -> anyhow::Result<()> {
+        let app = &mut self.app;
+        let ctx = &self.ctx;
+        diff::run(args, app, ctx).await
     }
 
     async fn test_qemu(&mut self, args: cli::ArgsTestQemu) -> anyhow::Result<()> {

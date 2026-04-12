@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
 
 use crate::context::AxvisorCliArgs;
 
@@ -107,6 +107,8 @@ pub enum TestCommand {
     Uboot(ArgsTestUboot),
     /// Run Axvisor remote board test suite
     Board(ArgsTestBoard),
+    /// Run Axvisor differential test suite
+    Diff(ArgsTestDiff),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -140,6 +142,26 @@ pub struct ArgsTestBoard {
 
     #[arg(long)]
     pub port: Option<u16>,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(group(
+    ArgGroup::new("selection")
+        .required(true)
+        .args(["suite", "case"])
+))]
+pub struct ArgsTestDiff {
+    #[arg(long, value_name = "ARCH")]
+    pub arch: String,
+
+    #[arg(long, value_name = "SUITE")]
+    pub suite: Option<PathBuf>,
+
+    #[arg(long, value_name = "CASE_DIR")]
+    pub case: Option<PathBuf>,
+
+    #[arg(long, value_name = "BOOL", num_args = 1)]
+    pub guest_log: Option<bool>,
 }
 
 #[derive(Subcommand)]
@@ -327,6 +349,117 @@ mod tests {
             },
             _ => panic!("expected test command"),
         }
+    }
+
+    #[test]
+    fn command_parses_test_diff_suite() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: Command,
+        }
+
+        let cli = Cli::try_parse_from([
+            "axvisor",
+            "test",
+            "diff",
+            "--arch",
+            "aarch64",
+            "--suite",
+            "test-suit/axvisor/suites/smoke.toml",
+            "--guest-log",
+            "false",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Test(args) => match args.command {
+                TestCommand::Diff(args) => {
+                    assert_eq!(args.arch, "aarch64");
+                    assert_eq!(
+                        args.suite,
+                        Some(PathBuf::from("test-suit/axvisor/suites/smoke.toml"))
+                    );
+                    assert_eq!(args.case, None);
+                    assert_eq!(args.guest_log, Some(false));
+                }
+                _ => panic!("expected diff test command"),
+            },
+            _ => panic!("expected test command"),
+        }
+    }
+
+    #[test]
+    fn command_parses_test_diff_case() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: Command,
+        }
+
+        let cli = Cli::try_parse_from([
+            "axvisor",
+            "test",
+            "diff",
+            "--arch",
+            "x86_64",
+            "--case",
+            "test-suit/axvisor/cpu-state/tlb-invalidate-basic",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Test(args) => match args.command {
+                TestCommand::Diff(args) => {
+                    assert_eq!(args.arch, "x86_64");
+                    assert_eq!(
+                        args.case,
+                        Some(PathBuf::from(
+                            "test-suit/axvisor/cpu-state/tlb-invalidate-basic"
+                        ))
+                    );
+                    assert_eq!(args.suite, None);
+                    assert_eq!(args.guest_log, None);
+                }
+                _ => panic!("expected diff test command"),
+            },
+            _ => panic!("expected test command"),
+        }
+    }
+
+    #[test]
+    fn command_rejects_test_diff_without_case_or_suite() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: Command,
+        }
+
+        assert!(Cli::try_parse_from(["axvisor", "test", "diff", "--arch", "aarch64"]).is_err());
+    }
+
+    #[test]
+    fn command_rejects_test_diff_with_case_and_suite() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: Command,
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "axvisor",
+                "test",
+                "diff",
+                "--arch",
+                "aarch64",
+                "--suite",
+                "suite.toml",
+                "--case",
+                "case-dir",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
