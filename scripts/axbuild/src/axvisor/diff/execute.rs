@@ -30,6 +30,11 @@ use crate::{
 
 const HOST_BOOT_TIMEOUT_SECS: u64 = 30;
 const HOST_COMMAND_TIMEOUT_SECS: u64 = 5;
+const HOST_VM_CREATE_TIMEOUT_SECS: u64 = 15;
+const HOST_GUEST_EXIT_GRACE_SECS: u64 = 2;
+const HOST_VM_STOP_TIMEOUT_SECS: u64 = 3;
+const HOST_VM_STATE_POLL_INTERVAL_MILLIS: u64 = 200;
+const AXVISOR_VCPU_BOOT_DELAY_STEP_SECS: u64 = 5;
 const QEMU_ROOTFS_PLACEHOLDER_OLD: &str = "${workspaceFolder}/tmp/rootfs.img";
 const QEMU_ROOTFS_PLACEHOLDER_NEW: &str = "${workspaceFolder}/os/axvisor/tmp/rootfs.img";
 
@@ -107,6 +112,36 @@ struct QemuConfigFile {
     to_bin: bool,
     #[serde(default)]
     uefi: bool,
+}
+
+#[derive(Debug, Clone)]
+enum HostSessionAction {
+    KeepAlive,
+    RestartRequired { reason: String },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VmCleanupStrategy {
+    GuestShouldSelfExit,
+    RunnerMustStop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmLifecycleState {
+    Active,
+    Stopped,
+    Missing,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct VmListResponse {
+    vms: Vec<VmListEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct VmListEntry {
+    id: usize,
+    state: String,
 }
 
 pub(super) async fn run(
@@ -190,6 +225,7 @@ async fn run_all_targets(
             arch: Some(plan.arch.clone()),
             target: None,
             plat_dyn: None,
+            debug: false,
             vmconfigs: vec![],
         },
         None,
@@ -202,33 +238,74 @@ async fn run_all_targets(
         .context("failed to build AxVisor host for diff run")?;
     let runtime = resolve_runtime_artifact_path(&built)
         .context("AxVisor host build finished without runtime artifact")?;
+    let runtime = runtime.to_path_buf();
     let qemu_config_path =
         qemu::default_qemu_config_template_path(&request.axvisor_dir, &request.arch);
-    let mut session = QemuSession::spawn(
+    let mut session = Some(spawn_prepared_target_session(
         &request.arch,
-        runtime,
-        load_qemu_args(&qemu_config_path, Some(&artifacts.target_rootfs), false)?,
+        &runtime,
+        &qemu_config_path,
+        &artifacts.target_rootfs,
         plan.guest_log,
-    )
-    .with_context(|| {
-        format!(
-            "failed to launch AxVisor host QEMU for arch `{}`",
-            request.arch
-        )
-    })?;
-
-    session
-        .wait_for_prompt(Duration::from_secs(HOST_BOOT_TIMEOUT_SECS))
-        .context("AxVisor host did not reach shell prompt in time")?;
+        prepared_cases,
+    )?);
 
     let mut records = Vec::with_capacity(plan.cases.len());
-    for (case, prepared) in plan.cases.iter().zip(prepared_cases) {
-        records.push(run_target_case(case, prepared, &mut session)?);
+    let mut host_log = String::new();
+    for (index, (case, prepared)) in plan.cases.iter().zip(prepared_cases).enumerate() {
+        loop {
+            let (record, action) = {
+                let session_ref = session
+                    .as_mut()
+                    .expect("target session should always exist before running a case");
+                run_target_case(case, prepared, session_ref)?
+            };
+
+            match action {
+                HostSessionAction::KeepAlive => {
+                    records.push(record);
+                    break;
+                }
+                HostSessionAction::RestartRequired { reason } => {
+                    records.push(record);
+
+                    let mut current = session
+                        .take()
+                        .expect("target session should exist when restart is requested");
+                    append_session_log(
+                        &mut host_log,
+                        current.buffer(),
+                        Some(&format!("host session restart requested: {reason}")),
+                    );
+                    current.terminate()?;
+
+                    if index + 1 < plan.cases.len() {
+                        session = Some(
+                            spawn_prepared_target_session(
+                                &request.arch,
+                                &runtime,
+                                &qemu_config_path,
+                                &artifacts.target_rootfs,
+                                plan.guest_log,
+                                prepared_cases,
+                            )
+                            .with_context(|| {
+                                format!("failed to relaunch AxVisor host after: {reason}")
+                            })?,
+                        );
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     let host_log_path = artifacts.run_dir.join("target-host.raw.log");
-    persist_text(&host_log_path, session.buffer())?;
-    session.terminate()?;
+    if let Some(mut session) = session {
+        append_session_log(&mut host_log, session.buffer(), None);
+        session.terminate()?;
+    }
+    persist_text(&host_log_path, &host_log)?;
 
     Ok((records, host_log_path, axvisor_build_config))
 }
@@ -272,33 +349,21 @@ fn run_target_case(
     case: &LoadedCase,
     prepared: &PreparedCaseAssets,
     session: &mut QemuSession,
-) -> anyhow::Result<SideExecutionRecord> {
+) -> anyhow::Result<(SideExecutionRecord, HostSessionAction)> {
     let raw_log_path = prepared.host_case_dir.join("target.raw.log");
     let result_path = prepared.host_case_dir.join("target.result.json");
     let log_start = session.buffer_len();
-    let mut cleanup_vm_id = None;
+    let cleanup_vm_id = prepared.vm_id;
     let outcome = (|| -> anyhow::Result<SideOutcome> {
-        let create_mark = session.buffer_len();
-        session.send_line(&session::render_vm_create_cmd(Path::new(
-            &prepared.guest_vm_config_path,
-        )))?;
-        let create_output = session
-            .wait_for_prompt_after(create_mark, Duration::from_secs(HOST_COMMAND_TIMEOUT_SECS))
-            .context("timed out waiting for `vm create` prompt")?;
-        let vm_id = session::parse_created_vm_ids(&create_output)
-            .into_iter()
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("failed to parse VM id from `vm create` output"))?;
-        cleanup_vm_id = Some(vm_id);
-
         let result_mark = session.buffer_len();
-        session.send_line(&session::render_vm_start_cmd(vm_id))?;
+        session.send_line(&session::render_vm_start_cmd(cleanup_vm_id))?;
         let _ = session
             .wait_for_prompt_after(result_mark, Duration::from_secs(HOST_COMMAND_TIMEOUT_SECS));
+        let result_timeout = Duration::from_secs(
+            case.manifest.timeout_secs + axvisor_vm_boot_delay_secs(cleanup_vm_id) + 1,
+        );
 
-        match session
-            .wait_for_result_after(result_mark, Duration::from_secs(case.manifest.timeout_secs))
-        {
+        match session.wait_for_result_after(result_mark, result_timeout) {
             Ok(payload) => {
                 let result = parse_guest_result(&payload, &case.manifest.id)?;
                 persist_guest_result(&result_path, &result)?;
@@ -313,8 +378,24 @@ fn run_target_case(
         message: err.to_string(),
     });
 
-    let cleanup_message =
-        cleanup_vm_id.and_then(|vm_id| cleanup_vm(session, vm_id).err().map(|err| err.to_string()));
+    let (cleanup_message, host_action) = {
+        let strategy = match &outcome {
+            SideOutcome::GuestResult { .. } => VmCleanupStrategy::GuestShouldSelfExit,
+            SideOutcome::RunnerError { .. } => VmCleanupStrategy::RunnerMustStop,
+        };
+        match cleanup_vm(session, cleanup_vm_id, strategy) {
+            Ok(note) => (note, HostSessionAction::KeepAlive),
+            Err(err) => (
+                Some(err.to_string()),
+                HostSessionAction::RestartRequired {
+                    reason: format!(
+                        "failed to finalize VM[{cleanup_vm_id}] for `{}`",
+                        case.manifest.id
+                    ),
+                },
+            ),
+        }
+    };
     let log_end = session.buffer_len();
     let mut raw_log = session.slice(log_start, log_end).to_string();
     if let Some(message) = cleanup_message {
@@ -324,19 +405,240 @@ fn run_target_case(
     let outcome = upgrade_outcome_with_runtime_failures(outcome, &raw_log);
     persist_text(&raw_log_path, &raw_log)?;
 
-    Ok(SideExecutionRecord {
-        raw_log_path: raw_log_path.display().to_string(),
-        result_path: matches!(&outcome, SideOutcome::GuestResult { .. })
-            .then(|| result_path.display().to_string()),
-        outcome,
-    })
+    Ok((
+        SideExecutionRecord {
+            raw_log_path: raw_log_path.display().to_string(),
+            result_path: matches!(&outcome, SideOutcome::GuestResult { .. })
+                .then(|| result_path.display().to_string()),
+            outcome,
+        },
+        host_action,
+    ))
 }
 
-fn cleanup_vm(session: &mut QemuSession, vm_id: usize) -> anyhow::Result<()> {
+fn cleanup_vm(
+    session: &mut QemuSession,
+    vm_id: usize,
+    strategy: VmCleanupStrategy,
+) -> anyhow::Result<Option<String>> {
+    let mut note = None;
+    match strategy {
+        VmCleanupStrategy::GuestShouldSelfExit => {
+            match wait_for_vm_terminal_state(
+                session,
+                vm_id,
+                Duration::from_secs(HOST_GUEST_EXIT_GRACE_SECS),
+            )? {
+                VmLifecycleState::Stopped | VmLifecycleState::Missing => {}
+                VmLifecycleState::Active => {
+                    stop_vm(session, vm_id)?;
+                    note = Some(format!(
+                        "guest did not stop itself within {}s; runner issued `vm stop`",
+                        HOST_GUEST_EXIT_GRACE_SECS
+                    ));
+                    wait_for_vm_terminal_state(
+                        session,
+                        vm_id,
+                        Duration::from_secs(HOST_VM_STOP_TIMEOUT_SECS),
+                    )?;
+                }
+            }
+        }
+        VmCleanupStrategy::RunnerMustStop => {
+            stop_vm(session, vm_id)?;
+            wait_for_vm_terminal_state(
+                session,
+                vm_id,
+                Duration::from_secs(HOST_VM_STOP_TIMEOUT_SECS),
+            )?;
+        }
+    }
+
+    if query_vm_state(session, vm_id)? != VmLifecycleState::Missing {
+        delete_vm(session, vm_id)?;
+    }
+
+    Ok(note)
+}
+
+fn stop_vm(session: &mut QemuSession, vm_id: usize) -> anyhow::Result<()> {
+    let stop_mark = session.buffer_len();
+    session.send_line(&session::render_vm_stop_cmd(vm_id))?;
+    session
+        .wait_for_prompt_after(stop_mark, Duration::from_secs(HOST_COMMAND_TIMEOUT_SECS))
+        .context("timed out waiting for `vm stop` prompt")?;
+    Ok(())
+}
+
+fn delete_vm(session: &mut QemuSession, vm_id: usize) -> anyhow::Result<()> {
     let delete_mark = session.buffer_len();
     session.send_line(&session::render_vm_delete_cmd(vm_id))?;
-    let _ = session.wait_for_prompt_after(delete_mark, Duration::from_secs(HOST_COMMAND_TIMEOUT_SECS));
+    session
+        .wait_for_prompt_after(delete_mark, Duration::from_secs(HOST_COMMAND_TIMEOUT_SECS))
+        .context("timed out waiting for `vm delete` prompt")?;
     Ok(())
+}
+
+fn wait_for_vm_terminal_state(
+    session: &mut QemuSession,
+    vm_id: usize,
+    timeout: Duration,
+) -> anyhow::Result<VmLifecycleState> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = query_vm_state(session, vm_id)?;
+        if matches!(state, VmLifecycleState::Stopped | VmLifecycleState::Missing) {
+            return Ok(state);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "VM[{vm_id}] did not reach a terminal state within {}s",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(HOST_VM_STATE_POLL_INTERVAL_MILLIS));
+    }
+}
+
+fn query_vm_state(session: &mut QemuSession, vm_id: usize) -> anyhow::Result<VmLifecycleState> {
+    let mark = session.buffer_len();
+    session.send_line(session::render_vm_list_json_cmd())?;
+    let output = session
+        .wait_for_prompt_after(mark, Duration::from_secs(HOST_COMMAND_TIMEOUT_SECS))
+        .context("timed out waiting for `vm list --format json` prompt")?;
+    parse_vm_state_from_vm_list_output(&output, vm_id)
+}
+
+fn parse_vm_state_from_vm_list_output(
+    output: &str,
+    vm_id: usize,
+) -> anyhow::Result<VmLifecycleState> {
+    if output.contains("No virtual machines found.") {
+        return Ok(VmLifecycleState::Missing);
+    }
+
+    let json = vm_list_json_regex()
+        .find_iter(output)
+        .last()
+        .map(|m| m.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to extract JSON payload from `vm list --format json` output")
+        })?;
+    let parsed: VmListResponse =
+        serde_json::from_str(json).context("failed to parse `vm list --format json` output")?;
+
+    let Some(entry) = parsed.vms.into_iter().find(|entry| entry.id == vm_id) else {
+        return Ok(VmLifecycleState::Missing);
+    };
+    let state = entry.state.to_ascii_lowercase();
+    if state == "stopped" {
+        Ok(VmLifecycleState::Stopped)
+    } else {
+        Ok(VmLifecycleState::Active)
+    }
+}
+
+fn vm_list_json_regex() -> &'static Regex {
+    static REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r#"(?s)\{\s*"vms"\s*:\s*\[.*?\]\s*\}"#).unwrap())
+}
+
+fn spawn_target_session(
+    arch: &str,
+    runtime: &Path,
+    qemu_config_path: &Path,
+    rootfs: &Path,
+    guest_log: bool,
+) -> anyhow::Result<QemuSession> {
+    let mut session = QemuSession::spawn(
+        arch,
+        runtime,
+        load_qemu_args(qemu_config_path, Some(rootfs), false)?,
+        guest_log,
+    )
+    .with_context(|| format!("failed to launch AxVisor host QEMU for arch `{arch}`"))?;
+
+    session
+        .wait_for_prompt(Duration::from_secs(HOST_BOOT_TIMEOUT_SECS))
+        .context("AxVisor host did not reach shell prompt in time")?;
+    Ok(session)
+}
+
+fn spawn_prepared_target_session(
+    arch: &str,
+    runtime: &Path,
+    qemu_config_path: &Path,
+    rootfs: &Path,
+    guest_log: bool,
+    prepared_cases: &[PreparedCaseAssets],
+) -> anyhow::Result<QemuSession> {
+    let mut session = spawn_target_session(arch, runtime, qemu_config_path, rootfs, guest_log)?;
+    prepare_target_vms(&mut session, prepared_cases)?;
+    Ok(session)
+}
+
+fn axvisor_vm_boot_delay_secs(vm_id: usize) -> u64 {
+    vm_id.saturating_sub(1) as u64 * AXVISOR_VCPU_BOOT_DELAY_STEP_SECS
+}
+
+fn prepare_target_vms(
+    session: &mut QemuSession,
+    prepared_cases: &[PreparedCaseAssets],
+) -> anyhow::Result<()> {
+    for prepared in prepared_cases {
+        let create_mark = session.buffer_len();
+        session.send_line(&session::render_vm_create_cmd(Path::new(
+            &prepared.guest_vm_config_path,
+        )))?;
+        let create_output = session
+            .wait_for_prompt_after(
+                create_mark,
+                Duration::from_secs(HOST_VM_CREATE_TIMEOUT_SECS),
+            )
+            .map_err(|err| {
+                err.context(format!(
+                    "timed out waiting for `vm create` prompt while preparing `{}`\nrecent host \
+                     output:\n{}",
+                    prepared.case_id,
+                    recent_output_tail(&session.buffer()[create_mark..], 24)
+                ))
+            })?;
+        let created_ids = session::parse_created_vm_ids(&create_output);
+        if !created_ids.contains(&prepared.vm_id) {
+            bail!(
+                "failed to observe prepared VM id {} while creating `{}`",
+                prepared.vm_id,
+                prepared.case_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn append_session_log(host_log: &mut String, session_log: &str, header: Option<&str>) {
+    if host_log.is_empty() {
+        if let Some(header) = header {
+            host_log.push_str("[axdiff host note] ");
+            host_log.push_str(header);
+            host_log.push('\n');
+        }
+        host_log.push_str(session_log);
+        return;
+    }
+
+    host_log.push_str("\n\n[axdiff host session boundary]\n");
+    if let Some(header) = header {
+        host_log.push_str("[axdiff host note] ");
+        host_log.push_str(header);
+        host_log.push('\n');
+    }
+    host_log.push_str(session_log);
+}
+
+fn recent_output_tail(output: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 fn compare_case(
@@ -600,6 +902,7 @@ fn write_diff_axvisor_build_config(
         .join("configs/board")
         .join(format!("qemu-{arch}.toml"));
     let mut board_file: AxvisorBoardFile = axvisor_build::load_board_file(&board_path)?;
+    board_file.config.arceos.log = axvisor_build::LogLevel::Warn;
     if !board_file
         .config
         .arceos
@@ -950,6 +1253,7 @@ vm_configs = ["old.toml"]
         let prepared = PreparedCaseAssets {
             case_id: "cpu.currentel.read".to_string(),
             asset_key: "cpu.currentel.read".to_string(),
+            vm_id: 1,
             package: "axvisor-currentel-read".to_string(),
             target: "aarch64-unknown-none-softfloat".to_string(),
             build_info_path: dir.path().join("build-aarch64.toml"),
@@ -992,6 +1296,34 @@ vm_configs = ["old.toml"]
         assert_eq!(
             comparison.detail,
             "target execution failed: runtime failure pattern detected in console log"
+        );
+    }
+
+    #[test]
+    fn parse_vm_state_from_vm_list_output_handles_stopped_and_missing() {
+        let stopped = r#"
+{
+  "vms": [
+    {
+      "id": 3,
+      "name": "axdiff-case",
+      "state": "Stopped",
+      "vcpu": 1,
+      "memory": "1GB"
+    }
+  ]
+}
+axvisor:/$
+"#;
+        assert_eq!(
+            parse_vm_state_from_vm_list_output(stopped, 3).unwrap(),
+            VmLifecycleState::Stopped
+        );
+
+        let empty = "No virtual machines found.\naxvisor:/$ ";
+        assert_eq!(
+            parse_vm_state_from_vm_list_output(empty, 3).unwrap(),
+            VmLifecycleState::Missing
         );
     }
 }

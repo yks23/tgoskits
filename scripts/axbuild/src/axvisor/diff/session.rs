@@ -13,6 +13,10 @@ pub(crate) fn render_vm_start_cmd(vm_id: usize) -> String {
     format!("vm start {vm_id}")
 }
 
+pub(crate) fn render_vm_stop_cmd(vm_id: usize) -> String {
+    format!("vm stop {vm_id}")
+}
+
 pub(crate) fn render_vm_delete_cmd(vm_id: usize) -> String {
     format!("vm delete {vm_id} --force")
 }
@@ -65,6 +69,7 @@ mod tests {
             "vm create /axdiff/cases/case-1/vm.toml"
         );
         assert_eq!(render_vm_start_cmd(3), "vm start 3");
+        assert_eq!(render_vm_stop_cmd(3), "vm stop 3");
         assert_eq!(render_vm_delete_cmd(3), "vm delete 3 --force");
         assert_eq!(render_vm_list_json_cmd(), "vm list --format json");
     }

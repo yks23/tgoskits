@@ -1886,10 +1886,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "axvisor-currentel-transition"
+version = "0.1.0"
+dependencies = [
+ "ax-memory-addr",
+ "ax-mm",
+ "ax-std",
+ "axvisor-guestlib",
+]
+
+[[package]]
 name = "axvisor-guestlib"
 version = "0.1.0"
 dependencies = [
  "ax-std",
+]
+
+[[package]]
+name = "axvisor-mpidr-multicore-read"
+version = "0.1.0"
+dependencies = [
+ "ax-std",
+ "axvisor-guestlib",
 ]
 
 [[package]]

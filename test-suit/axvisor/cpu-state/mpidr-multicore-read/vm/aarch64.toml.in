@@ -1,0 +1,40 @@
+# Vm base info configs
+#
+[base]
+id = 4
+name = "axdiff-mpidr-multicore-read"
+vm_type = 1
+cpu_num = 4
+phys_cpu_ids = [0, 1, 2, 3]
+
+#
+# Vm kernel configs
+#
+[kernel]
+entry_point = 0x8020_0000
+image_location = "fs"
+kernel_path = "/axdiff/images/cpu.mpidr.multicore-read/kernel.bin"
+kernel_load_addr = 0x8020_0000
+dtb_load_addr = 0x8000_0000
+
+memory_regions = [
+  [0x8000_0000, 0x4000_0000, 0x7, 1],
+]
+
+#
+# Device specifications
+#
+[devices]
+passthrough_devices = [
+  ["/"],
+]
+
+passthrough_addresses = []
+
+excluded_devices = [
+  ["/pcie@10000000"],
+]
+
+emu_devices = []
+
+interrupt_mode = "passthrough"

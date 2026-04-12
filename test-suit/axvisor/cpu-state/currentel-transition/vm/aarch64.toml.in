@@ -1,0 +1,40 @@
+# Vm base info configs
+#
+[base]
+id = 3
+name = "axdiff-currentel-transition"
+vm_type = 1
+cpu_num = 1
+phys_cpu_ids = [0]
+
+#
+# Vm kernel configs
+#
+[kernel]
+entry_point = 0x8020_0000
+image_location = "fs"
+kernel_path = "/axdiff/images/cpu.currentel.transition/kernel.bin"
+kernel_load_addr = 0x8020_0000
+dtb_load_addr = 0x8000_0000
+
+memory_regions = [
+  [0x8000_0000, 0x4000_0000, 0x7, 1],
+]
+
+#
+# Device specifications
+#
+[devices]
+passthrough_devices = [
+  ["/"],
+]
+
+passthrough_addresses = []
+
+excluded_devices = [
+  ["/pcie@10000000"],
+]
+
+emu_devices = []
+
+interrupt_mode = "passthrough"

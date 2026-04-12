@@ -117,6 +117,7 @@ mod tests {
         let prepared = vec![PreparedCaseAssets {
             case_id: "timer.basic".to_string(),
             asset_key: "timer.basic".to_string(),
+            vm_id: 1,
             package: "axvisor-timer-basic".to_string(),
             target: "aarch64-unknown-none-softfloat".to_string(),
             build_info_path: PathBuf::from("/tmp/case/build-aarch64.toml"),

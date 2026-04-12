@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use colored::Colorize;
 use serde::Serialize;
 
 use crate::{
@@ -44,13 +45,24 @@ pub(crate) async fn run(
     ctx: &AxvisorContext,
 ) -> anyhow::Result<()> {
     let plan = DiffPlan::from_args(args, ctx.workspace_root())?;
+    print_section("AxVisor Diff");
+    print_plan_overview(&plan);
+
+    print_phase(1, 5, "Resolve case layouts");
     let layouts = build::resolve_case_layouts(&plan.cases, &plan.arch)?;
+
+    print_phase(2, 5, "Prepare run artifacts");
     let artifacts = rootfs::prepare_run_artifacts(ctx, &plan.arch).await?;
+
+    print_phase(3, 5, "Build and stage guest cases");
     let prepared_cases =
         build::build_and_stage_cases(app, ctx, &plan.cases, &layouts, &artifacts, &plan.arch)
             .await?;
+
+    print_phase(4, 5, "Execute baseline and target runs");
     let execution = execute::run(&plan, app, ctx, &artifacts, &prepared_cases).await?;
 
+    print_phase(5, 5, "Write summary");
     report::write_summary(
         &artifacts.summary_path,
         &plan,
@@ -59,87 +71,73 @@ pub(crate) async fn run(
         &execution,
     )?;
 
-    match &plan.selection {
-        Selection::Suite(path) => {
-            let suite_name = plan.suite_name.as_deref().unwrap_or("<unnamed>");
-            println!(
-                "validated axvisor diff suite: {} (arch={}, guest_log={}, cases={})",
-                suite_name,
-                plan.arch,
-                plan.guest_log,
-                plan.cases.len()
-            );
-            println!("suite manifest: {}", path.display());
-        }
-        Selection::Case(path) => {
-            println!(
-                "validated axvisor diff case run (arch={}, guest_log={}, cases={})",
-                plan.arch,
-                plan.guest_log,
-                plan.cases.len()
-            );
-            println!("case dir: {}", path.display());
-        }
-    }
-
-    for case in &plan.cases {
-        println!(
-            "- {} [{}] timeout={}s @ {}",
-            case.manifest.id,
-            case.manifest.compare.mode.as_str(),
-            case.manifest.timeout_secs,
-            case.case_dir.display()
-        );
-    }
-    for (layout, prepared) in layouts.iter().zip(&prepared_cases) {
-        println!(
-            "  assets: vm_template={} baseline_qemu={}",
-            layout.vm_template.display(),
-            prepared.baseline_qemu_config.display()
-        );
-        println!(
-            "    staged: case_id={} asset_key={} package={} target={} build_config={} case_dir={} \
-             runtime={} kernel_host={} vm_host={} vm_guest={} kernel_guest={} weak_compare={}",
-            prepared.case_id,
-            prepared.asset_key,
-            prepared.package,
-            prepared.target,
-            prepared.build_info_path.display(),
-            prepared.host_case_dir.display(),
-            prepared.runtime_artifact_path.display(),
-            prepared.staged_kernel_host_path.display(),
-            prepared.rendered_vm_host_path.display(),
-            prepared.guest_vm_config_path,
-            prepared.guest_kernel_path,
-            prepared
-                .weak_compare_executable
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "-".to_string())
-        );
-    }
-
-    println!("run id: {}", artifacts.run_id);
-    println!("run dir: {}", artifacts.run_dir.display());
-    println!("target rootfs: {}", artifacts.target_rootfs.display());
-    println!("summary: {}", artifacts.summary_path.display());
-    println!("axvisor build config: {}", execution.axvisor_build_config);
-    println!("host log: {}", execution.axvisor_host_log);
-
     let passed = execution
         .cases
         .iter()
         .filter(|record| record.comparison.passed)
         .count();
     let total = execution.cases.len();
-    println!("diff result: {passed}/{total} case(s) passed");
+
+    print_section("Cases");
+    for (index, case) in plan.cases.iter().enumerate() {
+        let case_index = format!("[{}]", index + 1).bold().blue();
+        println!(
+            "{} {} {} timeout={}s",
+            case_index,
+            case.manifest.id,
+            format!("[{}]", case.manifest.compare.mode.as_str()).dimmed(),
+            case.manifest.timeout_secs
+        );
+        println!("    dir           : {}", case.case_dir.display());
+    }
+
+    print_section("Artifacts");
+    print_kv("run_id", &artifacts.run_id);
+    print_kv("run_dir", artifacts.run_dir.display());
+    print_kv("target_rootfs", artifacts.target_rootfs.display());
+    print_kv("summary", artifacts.summary_path.display());
+    print_kv("axvisor_build", &execution.axvisor_build_config);
+    print_kv("host_log", &execution.axvisor_host_log);
+    for (layout, prepared) in layouts.iter().zip(&prepared_cases) {
+        println!("- case {}", prepared.case_id);
+        print_kv("  package", &prepared.package);
+        print_kv("  target", &prepared.target);
+        print_kv("  asset_key", &prepared.asset_key);
+        print_kv("  build_config", prepared.build_info_path.display());
+        print_kv("  runtime", prepared.runtime_artifact_path.display());
+        print_kv("  vm_template", layout.vm_template.display());
+        print_kv("  baseline_qemu", prepared.baseline_qemu_config.display());
+        print_kv(
+            "  staged_kernel",
+            prepared.staged_kernel_host_path.display(),
+        );
+        print_kv("  staged_vm", prepared.rendered_vm_host_path.display());
+        print_kv("  guest_kernel", &prepared.guest_kernel_path);
+        print_kv("  guest_vm", &prepared.guest_vm_config_path);
+        print_kv(
+            "  weak_compare",
+            prepared
+                .weak_compare_executable
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        );
+    }
+
+    print_section("Results");
+    let summary = if passed == total {
+        format!("passed {passed}/{total} case(s)").bold().green()
+    } else {
+        format!("passed {passed}/{total} case(s)").bold().yellow()
+    };
+    println!("{summary}");
     for record in &execution.cases {
         let status = if record.comparison.passed {
-            "PASS"
+            "PASS".bold().green()
         } else {
-            "FAIL"
+            "FAIL".bold().red()
         };
-        println!("  {} {}: {}", status, record.id, record.comparison.detail);
+        println!("- {} {}: {}", status, record.id, record.comparison.detail);
     }
 
     if execution.passed {
@@ -196,6 +194,37 @@ fn resolve_cli_path(workspace_root: &Path, path: &Path) -> PathBuf {
     } else {
         workspace_root.join(path)
     }
+}
+
+fn print_section(title: &str) {
+    println!();
+    println!("{}", format!("== {title} ==").bold().cyan());
+}
+
+fn print_phase(index: usize, total: usize, title: &str) {
+    let step = format!("[{index}/{total}]").bold().blue();
+    println!("{step} {}", title.bold());
+}
+
+fn print_kv(label: &str, value: impl std::fmt::Display) {
+    println!("{:<14}: {}", label.bold(), value);
+}
+
+fn print_plan_overview(plan: &DiffPlan) {
+    match &plan.selection {
+        Selection::Suite(path) => {
+            print_kv("selection", "suite");
+            print_kv("suite", plan.suite_name.as_deref().unwrap_or("<unnamed>"));
+            print_kv("manifest", path.display());
+        }
+        Selection::Case(path) => {
+            print_kv("selection", "case");
+            print_kv("case_dir", path.display());
+        }
+    }
+    print_kv("arch", &plan.arch);
+    print_kv("guest_log", plan.guest_log);
+    print_kv("cases", plan.cases.len());
 }
 
 impl Selection {

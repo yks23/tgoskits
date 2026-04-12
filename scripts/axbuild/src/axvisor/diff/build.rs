@@ -8,7 +8,9 @@ use ostool::ctx::OutputArtifacts;
 use serde::Deserialize;
 
 use crate::{
-    arceos::build::{ArceosBuildInfo, load_or_create_build_info, resolve_build_info_path_in_dir},
+    arceos::build::{
+        ArceosBuildInfo, LogLevel, load_or_create_build_info, resolve_build_info_path_in_dir,
+    },
     axvisor::{
         context::AxvisorContext,
         diff::{
@@ -32,6 +34,7 @@ pub(super) struct CaseLayout {
 pub(super) struct PreparedCaseAssets {
     pub(crate) case_id: String,
     pub(crate) asset_key: String,
+    pub(crate) vm_id: usize,
     pub(crate) package: String,
     pub(crate) target: String,
     pub(crate) build_info_path: PathBuf,
@@ -107,10 +110,11 @@ pub(super) async fn build_and_stage_cases(
     let target = target_for_arch_checked(arch)?.to_string();
     let mut prepared = Vec::with_capacity(cases.len());
 
-    for (case, layout) in cases.iter().zip(layouts) {
+    for (index, (case, layout)) in cases.iter().zip(layouts).enumerate() {
         let package = resolve_case_package_name(&case.case_dir)?;
         let build_info_path = resolve_build_info_path_in_dir(&case.case_dir, &target);
         let asset_key = sanitize_asset_key(&case.manifest.id);
+        let vm_id = index + 1;
         let host_case_dir = artifacts.run_dir.join("cases").join(&asset_key);
         fs::create_dir_all(&host_case_dir)
             .with_context(|| format!("failed to create {}", host_case_dir.display()))?;
@@ -126,6 +130,7 @@ pub(super) async fn build_and_stage_cases(
         render_vm_config(
             &layout.vm_template,
             &rendered_vm_host_path,
+            vm_id,
             &guest_kernel_path,
         )?;
 
@@ -144,6 +149,7 @@ pub(super) async fn build_and_stage_cases(
         prepared.push(PreparedCaseAssets {
             case_id: case.manifest.id.clone(),
             asset_key,
+            vm_id,
             package,
             target: target.clone(),
             build_info_path,
@@ -212,9 +218,10 @@ async fn build_guest_case(
     target: &str,
     build_info_path: &Path,
 ) -> anyhow::Result<OutputArtifacts> {
-    let build_info: ArceosBuildInfo = load_or_create_build_info(build_info_path, || {
+    let mut build_info: ArceosBuildInfo = load_or_create_build_info(build_info_path, || {
         ArceosBuildInfo::default_for_target(target)
     })?;
+    build_info.log = LogLevel::Warn;
     let cargo = build_info.into_prepared_base_cargo_config(package, target, None)?;
     app.build_with_artifacts(cargo, build_info_path.to_path_buf())
         .await
@@ -260,9 +267,18 @@ fn sanitize_asset_key(case_id: &str) -> String {
 fn render_vm_config(
     template_path: &Path,
     output_path: &Path,
+    vm_id: usize,
     guest_kernel_path: &str,
 ) -> anyhow::Result<()> {
     let mut value = read_toml::<toml::Value>(template_path)?;
+    value
+        .get_mut("base")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow!("missing `[base]` section in {}", template_path.display()))?
+        .insert(
+            "id".to_string(),
+            toml::Value::Integer(i64::try_from(vm_id).context("vm_id does not fit in i64")?),
+        );
     value
         .get_mut("kernel")
         .and_then(toml::Value::as_table_mut)
@@ -444,7 +460,7 @@ version = "0.1.0"
     }
 
     #[test]
-    fn render_vm_config_rewrites_kernel_path() {
+    fn render_vm_config_rewrites_kernel_path_and_vm_id() {
         let dir = tempdir().unwrap();
         let template = dir.path().join("vm.toml.in");
         let output = dir.path().join("out/vm.toml");
@@ -461,13 +477,13 @@ kernel_path = "/old/kernel"
         )
         .unwrap();
 
-        render_vm_config(&template, &output, "/axdiff/images/case/kernel.bin").unwrap();
+        render_vm_config(&template, &output, 7, "/axdiff/images/case/kernel.bin").unwrap();
 
         let value: toml::Value = toml::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
         assert_eq!(
             value["kernel"]["kernel_path"].as_str(),
             Some("/axdiff/images/case/kernel.bin")
         );
-        assert_eq!(value["base"]["id"].as_integer(), Some(1));
+        assert_eq!(value["base"]["id"].as_integer(), Some(7));
     }
 }

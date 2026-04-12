@@ -3,5 +3,7 @@ name = "axvisor-smoke"
 [arches.aarch64]
 cases = [
   "cpu-state/currentel-read",
+  "cpu-state/currentel-transition",
+  "cpu-state/mpidr-multicore-read",
   "cpu-state/mpidr-read",
 ]

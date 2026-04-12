@@ -18,8 +18,13 @@ pub fn emit_json_result(case_id: &str, status: &str, diff_json: &str) {
 }
 
 pub fn power_off_or_hang() -> ! {
-    // Diff guests leave lifecycle control to the runner. After emitting the
-    // result payload, stay parked until the runner stops or deletes the VM.
+    #[cfg(feature = "ax-std")]
+    {
+        use std::os::arceos::modules::ax_hal;
+        ax_hal::power::system_off();
+    }
+
+    #[cfg(not(feature = "ax-std"))]
     loop {
         core::hint::spin_loop();
     }

@@ -56,6 +56,7 @@ pub(super) fn inject_host_file(
     inject_bytes(rootfs, guest_path, &bytes)
 }
 
+#[cfg(test)]
 pub(super) fn inject_text_file(
     rootfs: &Path,
     guest_path: &str,

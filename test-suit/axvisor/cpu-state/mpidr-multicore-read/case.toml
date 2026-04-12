@@ -1,0 +1,7 @@
+id = "cpu.mpidr.multicore-read"
+interface = "cpu-affinity-register-mpidr-el1"
+arch = ["aarch64"]
+timeout_secs = 10
+
+[compare]
+mode = "strong"
