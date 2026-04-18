@@ -14,6 +14,8 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
 
+use crate::file::{flock, record_lock};
+
 use super::{
     AsThread, FutexKey, ProcessData, TimerState, futex_table_for, send_signal_thread_inner,
     send_signal_to_process, send_signal_to_thread,
@@ -236,6 +238,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     let last_thread = process.exit_thread(curr.id().as_u64() as Pid, exit_code);
     thr.proc_data.thread_group_wait.wake();
     if last_thread {
+        let pid = process.pid();
+        flock::release_all_for_pid(pid);
+        record_lock::release_posix_for_pid(pid);
         process.exit();
         if let Some(parent) = process.parent() {
             if let Some(signo) = thr.proc_data.exit_signal {

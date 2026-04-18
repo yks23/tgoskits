@@ -1,5 +1,5 @@
 use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
-use core::ffi::c_char;
+use core::ffi::{c_char, c_int};
 use core::task::Poll;
 
 use ax_errno::{AxError, AxResult};
@@ -15,7 +15,7 @@ use starry_vm::vm_load_until_nul;
 
 use crate::{
     config::USER_HEAP_BASE,
-    file::{FD_TABLE, resolve_at},
+    file::{FD_TABLE, close_file_like, resolve_at},
     mm::{load_user_app, vm_load_string},
     task::{AsThread, ProcessData, kill_thread_for_execve_de_thread},
 };
@@ -108,7 +108,7 @@ fn apply_execve_image(
         .filter(|it| fd_table.get(*it).unwrap().cloexec)
         .collect::<Vec<_>>();
     for fd in cloexec_fds {
-        fd_table.remove(fd);
+        let _ = close_file_like(fd as c_int);
     }
     drop(fd_table);
 

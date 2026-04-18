@@ -1,7 +1,9 @@
 pub mod epoll;
 pub mod event;
+pub(crate) mod flock;
 mod fs;
 mod net;
+pub(crate) mod record_lock;
 mod pidfd;
 mod pipe;
 pub mod signalfd;
@@ -227,7 +229,17 @@ pub fn close_file_like(fd: c_int) -> AxResult {
         .write()
         .remove(fd as usize)
         .ok_or(AxError::BadFileDescriptor)?;
-    debug!("close_file_like <= count: {}", Arc::strong_count(&f.inner));
+    let sc = Arc::strong_count(&f.inner);
+    debug!("close_file_like <= count: {sc}");
+    if sc == 1 {
+        if let Ok(arc_file) = f.inner.clone().downcast_arc::<File>() {
+            if let Ok(st) = arc_file.stat() {
+                let key = (st.dev, st.ino);
+                flock::on_last_file_ref_drop(key, &f.inner);
+                record_lock::release_ofd(Arc::as_ptr(&f.inner) as usize);
+            }
+        }
+    }
     Ok(())
 }
 

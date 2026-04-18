@@ -7,6 +7,7 @@ use core::{
 
 use ax_errno::{AxError, AxResult};
 use ax_fs::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
+use ax_io::SeekFrom;
 use ax_task::current;
 use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Reference};
 use bitflags::bitflags;
@@ -14,8 +15,8 @@ use linux_raw_sys::general::*;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileLike, Pipe, add_file_like, close_file_like, get_file_like,
-        with_fs,
+        Directory, FD_TABLE, File, FileLike, Pipe, add_file_like, close_file_like, flock,
+        get_file_like, record_lock, with_fs,
     },
     mm::{UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
@@ -178,7 +179,7 @@ pub fn sys_close_range(first: i32, last: i32, flags: u32) -> AxResult<isize> {
                     f.cloexec = true;
                 }
             } else {
-                fd_table.remove(fd as _);
+                let _ = close_file_like(fd);
             }
         }
     }
@@ -228,12 +229,42 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
         .ok_or(AxError::BadFileDescriptor)?;
     f.cloexec = flags.contains(Dup3Flags::O_CLOEXEC);
 
-    fd_table.remove(new_fd as _);
+    let _ = close_file_like(new_fd);
     fd_table
         .add_at(new_fd as _, f)
         .map_err(|_| AxError::BadFileDescriptor)?;
 
     Ok(new_fd as _)
+}
+
+fn lock_inode_key(file: &File) -> AxResult<record_lock::InodeKey> {
+    let st = file.stat()?;
+    Ok((st.dev, st.ino))
+}
+
+fn resolve_record_range(file: &File, fl: &flock64) -> AxResult<(u64, u64)> {
+    let cur_off = file.inner().seek(SeekFrom::Current(0))? as u64;
+    let size = file.stat()?.size;
+    let base = match fl.l_whence as c_int {
+        0 => 0u64,
+        1 => cur_off,
+        2 => size,
+        _ => return Err(AxError::InvalidInput),
+    };
+    let start = (base as i128)
+        .saturating_add(fl.l_start as i128)
+        .max(0) as u64;
+    let end = if fl.l_len == 0 {
+        u64::MAX
+    } else {
+        (start as i128)
+            .saturating_add(fl.l_len as i128)
+            .max(0) as u64
+    };
+    if end < start {
+        return Err(AxError::InvalidInput);
+    }
+    Ok((start, end))
 }
 
 pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
@@ -242,12 +273,60 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
     match cmd as u32 {
         F_DUPFD => dup_fd(fd, false),
         F_DUPFD_CLOEXEC => dup_fd(fd, true),
-        F_SETLK | F_SETLKW => Ok(0),
-        F_OFD_SETLK | F_OFD_SETLKW => Ok(0),
-        F_GETLK | F_OFD_GETLK => {
-            let arg = UserPtr::<flock64>::from(arg);
-            arg.get_as_mut()?.l_type = F_UNLCK as _;
+        F_SETLK | F_SETLKW => {
+            let file = File::from_fd(fd)?;
+            let key = lock_inode_key(&file)?;
+            let fl = UserPtr::<flock64>::from(arg).get_as_mut()?;
+            let range = resolve_record_range(&file, fl)?;
+            let owner = record_lock::RLOwner::Posix(current().as_thread().proc_data.proc.pid());
+            let blocking = cmd as u32 == F_SETLKW;
+            record_lock::setlk(key, owner, range, fl.l_type, blocking)?;
             Ok(0)
+        }
+        F_OFD_SETLK | F_OFD_SETLKW => {
+            let file = File::from_fd(fd)?;
+            let key = lock_inode_key(&file)?;
+            let arc = get_file_like(fd)?;
+            let fl = UserPtr::<flock64>::from(arg).get_as_mut()?;
+            let range = resolve_record_range(&file, fl)?;
+            let owner = record_lock::RLOwner::Ofd(Arc::as_ptr(&arc) as usize);
+            let blocking = cmd as u32 == F_OFD_SETLKW;
+            record_lock::setlk(key, owner, range, fl.l_type, blocking)?;
+            Ok(0)
+        }
+        F_GETLK | F_OFD_GETLK => {
+            let file = File::from_fd(fd)?;
+            let key = lock_inode_key(&file)?;
+            let arc = get_file_like(fd)?;
+            let ofd = cmd as u32 == F_OFD_GETLK;
+            let owner = if ofd {
+                record_lock::RLOwner::Ofd(Arc::as_ptr(&arc) as usize)
+            } else {
+                record_lock::RLOwner::Posix(current().as_thread().proc_data.proc.pid())
+            };
+            let fl = UserPtr::<flock64>::from(arg).get_as_mut()?;
+            let range = resolve_record_range(&file, fl)?;
+            record_lock::getlk(key, owner, range, fl)?;
+            Ok(0)
+        }
+        F_SETLEASE | F_GETLEASE => Err(AxError::InvalidInput),
+        F_SETOWN => {
+            let file = File::from_fd(fd)?;
+            file.fasync_set_owner(arg as i32);
+            Ok(0)
+        }
+        F_GETOWN => {
+            let file = File::from_fd(fd)?;
+            Ok(file.fasync_get().0 as isize)
+        }
+        F_SETSIG => {
+            let file = File::from_fd(fd)?;
+            file.fasync_set_sig(arg as i32);
+            Ok(0)
+        }
+        F_GETSIG => {
+            let file = File::from_fd(fd)?;
+            Ok(file.fasync_get().1 as isize)
         }
         F_SETFL => {
             get_file_like(fd)?.set_nonblocking(arg & (O_NONBLOCK as usize) > 0)?;
@@ -300,13 +379,16 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         }
         _ => {
             warn!("unsupported fcntl parameters: cmd: {cmd}");
-            Ok(0)
+            Err(AxError::InvalidInput)
         }
     }
 }
 
 pub fn sys_flock(fd: c_int, operation: c_int) -> AxResult<isize> {
     debug!("flock <= fd: {fd}, operation: {operation}");
-    // TODO: flock
+    let file = File::from_fd(fd)?;
+    let key = lock_inode_key(&file)?;
+    let arc = get_file_like(fd)?;
+    flock::flock_inode(key, &arc, operation)?;
     Ok(0)
 }

@@ -100,6 +100,8 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
 pub struct File {
     inner: ax_fs::File,
     nonblock: AtomicBool,
+    /// `(F_SETOWN/F_GETOWN value, F_SETSIG/F_GETSIG value)` for async I/O metadata.
+    fasync: Mutex<(i32, i32)>,
 }
 
 impl File {
@@ -107,7 +109,20 @@ impl File {
         Self {
             inner,
             nonblock: AtomicBool::new(false),
+            fasync: Mutex::new((0, 0)),
         }
+    }
+
+    pub fn fasync_get(&self) -> (i32, i32) {
+        *self.fasync.lock()
+    }
+
+    pub fn fasync_set_owner(&self, owner: i32) {
+        self.fasync.lock().0 = owner;
+    }
+
+    pub fn fasync_set_sig(&self, sig: i32) {
+        self.fasync.lock().1 = sig;
     }
 
     pub fn inner(&self) -> &ax_fs::File {
