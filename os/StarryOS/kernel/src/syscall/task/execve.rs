@@ -13,11 +13,13 @@ use linux_raw_sys::general::{AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW
 use starry_process::Pid;
 use starry_vm::vm_load_until_nul;
 
+use linux_raw_sys::general::RLIMIT_STACK;
+
 use crate::{
-    config::USER_HEAP_BASE,
+    config::{USER_HEAP_BASE, USER_STACK_SIZE},
     file::{FD_TABLE, close_file_like, resolve_at},
     mm::{load_user_app, vm_load_string},
-    task::{AsThread, ProcessData, kill_thread_for_execve_de_thread},
+    task::{AsThread, ProcessData, kill_thread_for_execve_de_thread, rlim_is_infinite},
 };
 
 fn load_execve_strings(
@@ -85,9 +87,19 @@ fn apply_execve_image(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
 
+    let stack_bytes = {
+        let r = proc_data.rlim.read();
+        let sz = r[RLIMIT_STACK].current;
+        if rlim_is_infinite(sz) {
+            USER_STACK_SIZE
+        } else {
+            (sz as usize).max(ax_memory_addr::PAGE_SIZE_4K)
+        }
+    };
+
     let mut aspace = proc_data.aspace.lock();
     let (entry_point, user_stack_base) =
-        load_user_app(&mut aspace, Some(load_path), &args, &envs)?;
+        load_user_app(&mut aspace, Some(load_path), &args, &envs, stack_bytes)?;
     drop(aspace);
 
     let loc = loc_for_name()?;

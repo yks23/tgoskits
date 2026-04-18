@@ -377,6 +377,11 @@ impl AddrSpace {
     pub fn areas(&self) -> impl Iterator<Item = &MemoryArea<Backend>> {
         self.areas.iter()
     }
+
+    /// Total virtual size of all mapped areas (for `RLIMIT_AS` checks).
+    pub fn mapped_virtual_bytes(&self) -> usize {
+        self.areas().map(|a| a.size()).sum()
+    }
 }
 
 impl fmt::Debug for AddrSpace {

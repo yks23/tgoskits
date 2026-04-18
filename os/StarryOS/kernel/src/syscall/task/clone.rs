@@ -14,7 +14,10 @@ use starry_vm::VmMutPtr;
 use crate::{
     file::{FD_TABLE, FileLike, PidFd, close_file_like},
     mm::copy_from_kernel,
-    task::{AsThread, ProcessData, Thread, add_task_to_table, new_user_task},
+    task::{
+        AsThread, ProcessData, Thread, add_task_to_table, new_user_task, processes,
+        rlim_is_infinite,
+    },
 };
 
 bitflags! {
@@ -191,6 +194,11 @@ impl CloneArgs {
                 .set_page_table_root(old_proc_data.aspace.lock().page_table_root());
             old_proc_data.clone()
         } else {
+            let nproc = old_proc_data.rlim.read()[RLIMIT_NPROC].current;
+            if !rlim_is_infinite(nproc) && (processes().len() as u64) >= nproc {
+                return Err(AxError::WouldBlock);
+            }
+
             let proc = if flags.contains(CloneFlags::PARENT) {
                 old_proc_data.proc.parent().ok_or(AxError::InvalidInput)?
             } else {
@@ -226,6 +234,7 @@ impl CloneArgs {
                 signal_actions,
                 exit_signal,
             );
+            *proc_data.rlim.write() = old_proc_data.rlim.read().clone();
             proc_data.set_umask(old_proc_data.umask());
             proc_data.set_heap_top(old_proc_data.get_heap_top());
 

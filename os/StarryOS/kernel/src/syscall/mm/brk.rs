@@ -1,26 +1,40 @@
-use ax_errno::AxResult;
+use ax_errno::{AxError, AxResult};
 use ax_hal::paging::{MappingFlags, PageSize};
 use ax_memory_addr::{VirtAddr, align_up_4k};
 use ax_task::current;
+use linux_raw_sys::general::RLIMIT_DATA;
 
 use crate::{
     config::{USER_HEAP_BASE, USER_HEAP_SIZE, USER_HEAP_SIZE_MAX},
     mm::Backend,
-    task::AsThread,
+    task::{AsThread, rlim_is_infinite},
 };
+
+fn effective_heap_limit(proc_data: &crate::task::ProcessData) -> usize {
+    let d = proc_data.rlim.read()[RLIMIT_DATA].current;
+    let cap = if rlim_is_infinite(d) {
+        USER_HEAP_SIZE_MAX
+    } else {
+        (d as usize).min(USER_HEAP_SIZE_MAX)
+    };
+    USER_HEAP_BASE.saturating_add(cap)
+}
 
 pub fn sys_brk(addr: usize) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let current_top = proc_data.get_heap_top() as usize;
-    let heap_limit = USER_HEAP_BASE + USER_HEAP_SIZE_MAX;
+    let heap_limit = effective_heap_limit(proc_data);
 
     if addr == 0 {
         return Ok(current_top as isize);
     }
 
-    if addr < USER_HEAP_BASE || addr > heap_limit {
-        return Ok(current_top as isize);
+    if addr < USER_HEAP_BASE {
+        return Err(AxError::InvalidInput);
+    }
+    if addr > heap_limit {
+        return Err(AxError::NoMemory);
     }
 
     let new_top_aligned = align_up_4k(addr);
@@ -34,34 +48,25 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
         let expand_start = VirtAddr::from(initial_heap_end.max(current_top_aligned));
         let expand_size = new_top_aligned.saturating_sub(expand_start.as_usize());
 
-        if expand_size > 0
-            && proc_data
-                .aspace
-                .lock()
-                .map(
-                    expand_start,
-                    expand_size,
-                    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-                    false,
-                    Backend::new_alloc(expand_start, PageSize::Size4K),
-                )
-                .is_err()
-        {
-            return Ok(current_top as isize);
+        if expand_size > 0 {
+            proc_data.aspace.lock().map(
+                expand_start,
+                expand_size,
+                MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+                false,
+                Backend::new_alloc(expand_start, PageSize::Size4K),
+            )?;
         }
     } else if new_top_aligned < current_top_aligned {
         // Only unmap pages beyond the initially mapped heap region.
         let shrink_start = VirtAddr::from(initial_heap_end.max(new_top_aligned));
         let shrink_size = current_top_aligned.saturating_sub(shrink_start.as_usize());
 
-        if shrink_size > 0
-            && proc_data
+        if shrink_size > 0 {
+            proc_data
                 .aspace
                 .lock()
-                .unmap(shrink_start, shrink_size)
-                .is_err()
-        {
-            return Ok(current_top as isize);
+                .unmap(shrink_start, shrink_size)?;
         }
     }
 

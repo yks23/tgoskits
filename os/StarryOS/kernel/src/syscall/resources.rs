@@ -1,12 +1,16 @@
 use ax_errno::{AxError, AxResult};
 use ax_hal::time::TimeValue;
 use ax_task::current;
-use linux_raw_sys::general::{__kernel_old_timeval, RLIM_NLIMITS, rlimit64, rusage};
+use linux_raw_sys::general::{
+    __kernel_old_timeval, RLIM64_INFINITY, RLIM_NLIMITS, RLIMIT_NOFILE, rlimit64, rusage,
+};
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    task::{AsThread, Thread, get_process_data, get_task},
+    task::{
+        AsThread, Thread, AX_FILE_LIMIT, get_process_data, get_task, rlim_is_infinite,
+    },
     time::TimeValueLike,
 };
 
@@ -20,7 +24,13 @@ pub fn sys_prlimit64(
         return Err(AxError::InvalidInput);
     }
 
-    let proc_data = get_process_data(pid)?;
+    let self_pid = current().as_thread().proc_data.proc.pid();
+    let target_pid = if pid == 0 { self_pid } else { pid };
+    if target_pid != self_pid {
+        return Err(AxError::OperationNotPermitted);
+    }
+
+    let proc_data = get_process_data(target_pid)?;
     if let Some(old_limit) = old_limit.nullable() {
         let limit = &proc_data.rlim.read()[resource];
         old_limit.vm_write(rlimit64 {
@@ -30,22 +40,49 @@ pub fn sys_prlimit64(
     }
 
     if let Some(new_limit) = new_limit.nullable() {
-        // FIXME: AnyBitPattern
         let new_limit = unsafe { new_limit.vm_read_uninit()?.assume_init() };
-        if new_limit.rlim_cur > new_limit.rlim_max {
+        if !rlim_is_infinite(new_limit.rlim_cur)
+            && !rlim_is_infinite(new_limit.rlim_max)
+            && new_limit.rlim_cur > new_limit.rlim_max
+        {
             return Err(AxError::InvalidInput);
         }
 
-        let limit = &mut proc_data.rlim.write()[resource];
-        if new_limit.rlim_max <= limit.max {
-            limit.max = new_limit.rlim_max;
+        let hard_cap = if resource == RLIMIT_NOFILE as u32 {
+            AX_FILE_LIMIT as u64
         } else {
-            // TODO: patch resources
-            // return Err(AxError::OperationNotPermitted);
-            return Ok(0);
-        }
+            RLIM64_INFINITY
+        };
 
-        limit.current = new_limit.rlim_cur;
+        let mut rlim = proc_data.rlim.write();
+        let ent = &mut rlim[resource];
+
+        let new_max = if rlim_is_infinite(new_limit.rlim_max) {
+            if resource == RLIMIT_NOFILE as u32 {
+                hard_cap
+            } else {
+                RLIM64_INFINITY
+            }
+        } else {
+            let capped = if rlim_is_infinite(hard_cap) {
+                new_limit.rlim_max
+            } else {
+                new_limit.rlim_max.min(hard_cap)
+            };
+            capped
+        };
+
+        ent.max = new_max;
+
+        let new_cur = if rlim_is_infinite(new_limit.rlim_cur) {
+            ent.max
+        } else {
+            new_limit.rlim_cur.min(ent.max)
+        };
+        ent.current = new_cur;
+        if ent.current > ent.max {
+            ent.current = ent.max;
+        }
     }
 
     Ok(0)

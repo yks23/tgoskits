@@ -37,8 +37,14 @@ pub fn init(args: &[String], envs: &[String]) {
         })
         .expect("Failed to create user address space");
 
-    let (entry_vaddr, ustack_top) = load_user_app(&mut uspace, None, args, envs)
-        .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
+    let (entry_vaddr, ustack_top) = load_user_app(
+        &mut uspace,
+        None,
+        args,
+        envs,
+        crate::config::USER_STACK_SIZE,
+    )
+    .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
     let mut task = new_user_task(name, uctx, 0);

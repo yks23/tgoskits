@@ -283,6 +283,7 @@ pub fn load_user_app(
     path: Option<&str>,
     args: &[String],
     envs: &[String],
+    user_stack_size: usize,
 ) -> AxResult<(VirtAddr, VirtAddr)> {
     let path = path
         .or_else(|| args.first().map(String::as_str))
@@ -293,7 +294,7 @@ pub fn load_user_app(
         let new_args: Vec<String> = iter::once("/bin/sh".to_owned())
             .chain(args.iter().cloned())
             .collect();
-        return load_user_app(uspace, None, &new_args, envs);
+        return load_user_app(uspace, None, &new_args, envs, user_stack_size);
     }
 
     let (entry, auxv) = match { ELF_LOADER.lock().load(uspace, path)? } {
@@ -311,14 +312,16 @@ pub fn load_user_app(
                     .chain(iter::once(path.to_owned()))
                     .chain(args.iter().skip(1).cloned())
                     .collect();
-                return load_user_app(uspace, None, &new_args, envs);
+                return load_user_app(uspace, None, &new_args, envs, user_stack_size);
             }
             return Err(AxError::InvalidExecutable);
         }
     };
 
     let ustack_top = VirtAddr::from_usize(crate::config::USER_STACK_TOP);
-    let ustack_size = crate::config::USER_STACK_SIZE;
+    let ustack_size = user_stack_size
+        .max(PAGE_SIZE_4K * 4)
+        .next_multiple_of(PAGE_SIZE_4K);
     let ustack_start = ustack_top - ustack_size;
     debug!("Mapping user stack: {ustack_start:#x?} -> {ustack_top:#x?}");
 

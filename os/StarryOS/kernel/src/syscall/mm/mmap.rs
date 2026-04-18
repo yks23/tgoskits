@@ -12,7 +12,7 @@ use crate::{
     file::get_file_like,
     mm::{Backend, SharedPages},
     pseudofs::{Device, DeviceMmap},
-    task::AsThread,
+    task::{AsThread, rlim_is_infinite},
 };
 
 bitflags::bitflags! {
@@ -263,6 +263,15 @@ pub fn sys_mmap(
         }
         _ => return Err(AxError::InvalidInput),
     };
+
+    let as_cur = curr.as_thread().proc_data.rlim.read()[RLIMIT_AS].current;
+    if !rlim_is_infinite(as_cur) {
+        let mapped = aspace.mapped_virtual_bytes();
+        let need = (mapped as u128).saturating_add(length as u128);
+        if need > as_cur as u128 {
+            return Err(AxError::NoMemory);
+        }
+    }
 
     let populate = map_flags.contains(MmapFlags::POPULATE);
     aspace.map(start, length, permission_flags.into(), populate, backend)?;
