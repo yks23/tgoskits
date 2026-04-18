@@ -8,7 +8,9 @@ export MEMTRACK := n
 export BLK := y
 export NET := y
 export VSOCK := n
-export MEM := 1G
+# Guest RAM (rollback: MEM := 1G)
+export MEM := 4G
+export SMP ?= 4
 export ICOUNT := n
 
 # Generated Options
@@ -46,6 +48,10 @@ build run debug disasm: defconfig
 
 ci-test:
 	./scripts/ci-test.py $(ARCH)
+
+.PHONY: selfhost
+selfhost: rootfs
+	@$(MAKE) -C make run APP_FEATURES=qemu,smp MEM=8G SMP=8
 
 # Aliases
 rv:
