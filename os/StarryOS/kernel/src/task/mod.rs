@@ -75,6 +75,9 @@ pub struct Thread {
     /// Ready to exit
     pub exit: Arc<AtomicBool>,
 
+    /// Set by `execve` de-thread to force this thread to exit alone (no group exit).
+    pub execve_kill: AtomicBool,
+
     /// Indicates whether the thread is currently accessing user memory.
     accessing_user_memory: AtomicBool,
 
@@ -96,6 +99,7 @@ impl Thread {
             robust_list_head: AtomicUsize::new(0),
             time: AssumeSync(RefCell::new(TimeManager::new())),
             exit: Arc::new(AtomicBool::new(false)),
+            execve_kill: AtomicBool::new(false),
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
             exit_event: Arc::default(),
@@ -143,6 +147,11 @@ impl Thread {
     /// Set the thread to exit.
     pub fn set_exit(&self) {
         self.exit.store(true, Ordering::Release);
+    }
+
+    /// Request this thread to exit for `execve` sibling teardown (checked in the user loop).
+    pub fn request_execve_kill(&self) {
+        self.execve_kill.store(true, Ordering::Release);
     }
 
     /// Check if the thread is accessing user memory.
@@ -220,6 +229,8 @@ pub struct ProcessData {
 
     /// The child exit wait event
     pub child_exit_event: Arc<PollSet>,
+    /// Woken when any thread in this process leaves the thread-group set (for `execve` de-thread).
+    pub thread_group_wait: Arc<PollSet>,
     /// Self exit event
     pub exit_event: Arc<PollSet>,
     /// The exit signal of the thread
@@ -256,6 +267,7 @@ impl ProcessData {
             rlim: RwLock::default(),
 
             child_exit_event: Arc::default(),
+            thread_group_wait: Arc::default(),
             exit_event: Arc::default(),
             exit_signal,
 

@@ -9,7 +9,7 @@ use ax_task::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
 use spin::RwLock;
-use starry_process::{Pid, ProcessGroup, Session};
+use starry_process::{Pid, Process, ProcessGroup, Session};
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
@@ -81,6 +81,18 @@ pub fn get_task(tid: Pid) -> AxResult<AxTaskRef> {
         return Ok(current().clone());
     }
     TASK_TABLE.read().get(&tid).ok_or(AxError::NoSuchProcess)
+}
+
+/// Ask another thread in the same process to exit without `exit_group` (for `execve` de-thread).
+pub fn kill_thread_for_execve_de_thread(proc: &Arc<Process>, tid: Pid) -> AxResult<()> {
+    let task = get_task(tid)?;
+    let thr = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    if !Arc::ptr_eq(&thr.proc_data.proc, proc) {
+        return Err(AxError::NoSuchProcess);
+    }
+    thr.request_execve_kill();
+    task.interrupt();
+    Ok(())
 }
 
 /// Lists all processes.
@@ -221,7 +233,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     }
 
     let process = &thr.proc_data.proc;
-    if process.exit_thread(curr.id().as_u64() as Pid, exit_code) {
+    let last_thread = process.exit_thread(curr.id().as_u64() as Pid, exit_code);
+    thr.proc_data.thread_group_wait.wake();
+    if last_thread {
         process.exit();
         if let Some(parent) = process.parent() {
             if let Some(signo) = thr.proc_data.exit_signal {
