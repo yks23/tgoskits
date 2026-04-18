@@ -8,7 +8,7 @@ use linux_raw_sys::net::{
     MSG_PEEK, MSG_TRUNC, SCM_RIGHTS, SOL_SOCKET, cmsghdr, msghdr, sockaddr, socklen_t,
 };
 
-use super::addr::SocketAddrExt;
+use super::addr::{SocketAddrExt, normalize_socket_addr_ex_for_ip_stack, socket_addr_ex_for_user_name};
 use crate::{
     file::{FileLike, Socket, add_file_like},
     mm::{IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut},
@@ -26,7 +26,10 @@ fn send_impl(
     let addr = if addr.is_null() || addrlen == 0 {
         None
     } else {
-        Some(SocketAddrEx::read_from_user(addr, addrlen)?)
+        Some(normalize_socket_addr_ex_for_ip_stack(
+            SocketAddrEx::read_from_user(addr, addrlen)?,
+            false,
+        )?)
     };
 
     debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {addr:?}");
@@ -113,7 +116,9 @@ fn recv_impl(
     )?;
 
     if let Some(remote_addr) = remote_addr {
-        remote_addr.write_to_user(addr, addrlen.get_as_mut()?)?;
+        let presented =
+            socket_addr_ex_for_user_name(socket.ip_domain(), remote_addr)?;
+        presented.write_to_user(addr, addrlen.get_as_mut()?)?;
     }
 
     if let Some(mut builder) = cmsg_builder {

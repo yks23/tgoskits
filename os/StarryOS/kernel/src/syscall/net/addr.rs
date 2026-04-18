@@ -15,6 +15,73 @@ use linux_raw_sys::net::*;
 
 use crate::mm::{UserConstPtr, UserPtr};
 
+/// `IPPROTO_IPV6` (Linux), for IPv6 socket options.
+pub const IPPROTO_IPV6: u32 = 41;
+/// `IPV6_V6ONLY` (Linux).
+pub const IPV6_V6ONLY: u32 = 26;
+
+/// Read a `sockaddr_in6` from user space (thin wrapper around [`SocketAddrV6::read_from_user`]).
+pub fn from_sockaddr_in6(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<SocketAddrV6> {
+    SocketAddrV6::read_from_user(addr, addrlen)
+}
+
+/// Serialize `sockaddr_in6` to user space.
+pub fn to_sockaddr_in6(
+    addr: &SocketAddrV6,
+    dst: UserPtr<sockaddr>,
+    addrlen: &mut socklen_t,
+) -> AxResult<()> {
+    addr.write_to_user(dst, addrlen)
+}
+
+/// Map an IPv4 loopback / any / concrete address into IPv4 for the v4-only stack from an IPv6
+/// socket address (`::`, `::1`, `::ffff:x.x.x.x`, or a non-mappable IPv6 address).
+pub fn normalize_socket_addr_ex_for_ip_stack(addr: SocketAddrEx, is_bind: bool) -> AxResult<SocketAddrEx> {
+    match addr {
+        SocketAddrEx::Ip(SocketAddr::V4(_)) => Ok(addr),
+        SocketAddrEx::Ip(SocketAddr::V6(v6)) => {
+            let ip = *v6.ip();
+            let v4 = if let Some(v4) = ip.to_ipv4_mapped() {
+                v4
+            } else if ip.is_unspecified() {
+                if !is_bind {
+                    return Err(AxError::from(LinuxError::EINVAL));
+                }
+                Ipv4Addr::UNSPECIFIED
+            } else if ip == Ipv6Addr::LOCALHOST {
+                Ipv4Addr::LOCALHOST
+            } else if is_bind {
+                return Err(AxError::from(LinuxError::EADDRNOTAVAIL));
+            } else {
+                return Err(AxError::from(LinuxError::ENETUNREACH));
+            };
+            Ok(SocketAddrEx::Ip(SocketAddr::V4(SocketAddrV4::new(v4, v6.port()))))
+        }
+        SocketAddrEx::Unix(_) => Ok(addr),
+        #[cfg(feature = "vsock")]
+        SocketAddrEx::Vsock(_) => Ok(addr),
+    }
+}
+
+/// Present `SocketAddrEx` for `getsockname` / `getpeername` / `recvfrom`: IPv6 sockets see
+/// IPv4-mapped IPv6 addresses.
+pub fn socket_addr_ex_for_user_name(domain: u32, addr: SocketAddrEx) -> AxResult<SocketAddrEx> {
+    if domain as u32 != AF_INET6 {
+        return Ok(addr);
+    }
+    match addr {
+        SocketAddrEx::Ip(SocketAddr::V4(v4)) => Ok(SocketAddrEx::Ip(SocketAddr::V6(
+            socket_addr_v4_to_mapped_v6(&v4),
+        ))),
+        _ => Ok(addr),
+    }
+}
+
+/// Convert an IPv4 socket address to IPv4-mapped IPv6 (`::ffff:a.b.c.d`).
+pub fn socket_addr_v4_to_mapped_v6(v4: &SocketAddrV4) -> SocketAddrV6 {
+    SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0)
+}
+
 /// Trait to extend [`SocketAddr`] and its variants with methods for reading
 /// from and writing to user space.
 pub trait SocketAddrExt: Sized {
@@ -263,6 +330,14 @@ impl SocketAddrExt for SocketAddrEx {
     }
 
     fn family(&self) -> u16 {
-        AF_INET as u16
+        match self {
+            SocketAddrEx::Ip(ip) => match ip {
+                SocketAddr::V4(_) => AF_INET as u16,
+                SocketAddr::V6(_) => AF_INET6 as u16,
+            },
+            SocketAddrEx::Unix(_) => AF_UNIX as u16,
+            #[cfg(feature = "vsock")]
+            SocketAddrEx::Vsock(_) => AF_VSOCK as u16,
+        }
     }
 }

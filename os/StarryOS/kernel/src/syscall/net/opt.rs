@@ -1,3 +1,5 @@
+use core::mem::size_of;
+
 use ax_errno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
 use linux_raw_sys::net::socklen_t;
@@ -5,6 +7,7 @@ use linux_raw_sys::net::socklen_t;
 use crate::{
     file::{FileLike, Socket},
     mm::{UserConstPtr, UserPtr},
+    syscall::net::addr::{IPPROTO_IPV6, IPV6_V6ONLY},
 };
 
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
@@ -138,6 +141,12 @@ pub fn sys_getsockopt(
     }
 
     let socket = Socket::from_fd(fd)?;
+
+    if level == IPPROTO_IPV6 && optname == IPV6_V6ONLY {
+        *get::<i32>(optval, optlen)? = 0;
+        return Ok(0);
+    }
+
     macro_rules! dispatch {
         ($which:ident) => {
             socket.get_option(GetSocketOption::$which(get(optval, optlen)?))?;
@@ -177,6 +186,12 @@ pub fn sys_setsockopt(
     }
 
     let socket = Socket::from_fd(fd)?;
+
+    if level == IPPROTO_IPV6 && optname == IPV6_V6ONLY {
+        let _ = *get::<i32>(optval, optlen)?;
+        return Ok(0);
+    }
+
     macro_rules! dispatch {
         ($which:ident) => {
             socket.set_option(SetSocketOption::$which(get(optval, optlen)?))?;

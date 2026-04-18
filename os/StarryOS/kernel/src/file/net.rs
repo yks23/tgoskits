@@ -12,13 +12,31 @@ use linux_raw_sys::general::S_IFSOCK;
 use super::{FileLike, Kstat};
 use crate::file::{IoDst, IoSrc, get_file_like};
 
-pub struct Socket(pub SocketInner);
+/// Kernel-side socket wrapper. `ip_domain` is `AF_INET` / `AF_INET6` for IP sockets and
+/// ignored for Unix/vsock; it controls how addresses are presented on `getsockname` /
+/// `getpeername` (v4-mapped IPv6 when `AF_INET6`).
+pub struct Socket {
+    pub inner: SocketInner,
+    pub ip_domain: u32,
+}
+
+impl Socket {
+    pub fn new(inner: SocketInner, ip_domain: u32) -> Self {
+        Self { inner, ip_domain }
+    }
+
+    /// Address family passed to `socket()` for this fd (`AF_INET` or `AF_INET6`).
+    #[inline]
+    pub fn ip_domain(&self) -> u32 {
+        self.ip_domain
+    }
+}
 
 impl Deref for Socket {
     type Target = SocketInner;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
@@ -48,7 +66,7 @@ impl FileLike for Socket {
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult<()> {
-        self.0
+        self.inner
             .set_option(SetSocketOption::NonBlocking(&nonblocking))
     }
 
@@ -67,10 +85,10 @@ impl FileLike for Socket {
 }
 impl Pollable for Socket {
     fn poll(&self) -> IoEvents {
-        self.0.poll()
+        self.inner.poll()
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        self.0.register(context, events);
+        self.inner.register(context, events);
     }
 }
