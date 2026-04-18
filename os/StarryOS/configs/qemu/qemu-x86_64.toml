@@ -13,3 +13,12 @@ uefi = false
 to_bin = false
 success_regex = []
 fail_regex = ["(?i)\\bpanic(?:ked)?\\b"]
+
+# Self-hosting (T4): keep the default `args` above for CI. To attach a second ext4
+# image and a virtio-9p export for local development, append QEMU arguments similar to:
+#   -drive id=disk1,if=none,format=raw,file=/path/to/secondary-ext4.img
+#   -device virtio-blk-pci,drive=disk1
+#   -fsdev local,id=hostsrc,path=/path/on/host,security_model=none
+#   -device virtio-9p-pci,fsdev=hostsrc,mount_tag=hostsrc
+# Then in the guest: mount -t ext4 /dev/vdb /mnt  and  mount -t 9p hostsrc /workspace -o trans=virtio,version=9p2000.L
+# (9p mount is not yet wired in the kernel; ext4 on /dev/vdb is.)

@@ -15,3 +15,11 @@ uefi = false
 to_bin = true
 success_regex = []
 fail_regex = ["(?i)\\bpanic(?:ked)?\\b"]
+
+# Self-hosting (T4): default `args` stay minimal for CI. For a second ext4 disk + 9p share,
+# append for example:
+#   -drive id=disk1,if=none,format=raw,file=/path/to/secondary-ext4.img
+#   -device virtio-blk-pci,drive=disk1
+#   -fsdev local,id=hostsrc,path=/path/on/host,security_model=none
+#   -device virtio-9p-pci,fsdev=hostsrc,mount_tag=hostsrc
+# Guest: mount -t ext4 /dev/vdb /mnt ; 9p mount remains future work.
