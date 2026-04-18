@@ -13,8 +13,10 @@ extern crate alloc;
 extern crate log;
 
 use alloc::{
+    collections::BTreeMap,
     format,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 
@@ -23,11 +25,39 @@ use ax_driver::{
     prelude::{BaseDriverOps, BlockDriverOps},
     scan_partitions,
 };
+use ax_sync::Mutex as AxSyncMutex;
+use spin::Mutex as SpinMutex;
 
 mod fs;
 
 mod highlevel;
 pub use highlevel::*;
+pub use fs::new_ext4_shared;
+
+/// Block devices discovered during boot but not used as root, keyed by virtio-blk probe order.
+static SPARE_BLOCK_DEVS: SpinMutex<Option<BTreeMap<usize, Arc<AxSyncMutex<AxBlockDevice>>>>> =
+    SpinMutex::new(None);
+
+/// Map `/dev/vdX` paths to the virtio-blk enumeration index (`vda` → 0, `vdb` → 1, …).
+pub fn virtio_disk_index_for_path(path: &str) -> Option<usize> {
+    let suffix = path.strip_prefix("/dev/vd")?;
+    if suffix.len() != 1 {
+        return None;
+    }
+    let c = suffix.as_bytes()[0];
+    if !(b'a'..=b'z').contains(&c) {
+        return None;
+    }
+    Some((c - b'a') as usize)
+}
+
+/// Clone the shared mutex for a spare whole-disk block device, if present.
+pub fn spare_block_disk(disk_index: usize) -> Option<Arc<AxSyncMutex<AxBlockDevice>>> {
+    SPARE_BLOCK_DEVS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&disk_index).cloned())
+}
 
 #[derive(Debug, Default)]
 struct RootSpec {
@@ -125,6 +155,12 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>, bootar
 
     let mp = axfs_ng_vfs::Mountpoint::new_root(&fs);
     ROOT_FS_CONTEXT.call_once(|| FsContext::new(mp.root_location()));
+
+    let mut spare: BTreeMap<usize, Arc<AxSyncMutex<AxBlockDevice>>> = BTreeMap::new();
+    for disk in disks {
+        spare.insert(disk.disk_index, Arc::new(AxSyncMutex::new(disk.dev)));
+    }
+    *SPARE_BLOCK_DEVS.lock() = Some(spare);
 }
 
 fn collect_disks(block_devs: &mut AxDeviceContainer<AxBlockDevice>) -> Vec<DiscoveredDisk> {

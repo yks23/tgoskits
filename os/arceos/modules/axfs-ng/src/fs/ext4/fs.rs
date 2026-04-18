@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 use core::cell::OnceCell;
 
 use ax_driver::{AxBlockDevice, PartitionRegion};
+use ax_sync::Mutex as AxSyncMutex;
 use ax_kspin::{SpinNoPreempt as Mutex, SpinNoPreemptGuard as MutexGuard};
 use axfs_ng_vfs::{
     DirEntry, DirNode, Filesystem, FilesystemOps, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
@@ -23,6 +24,25 @@ pub struct Ext4Filesystem {
 impl Ext4Filesystem {
     pub fn new(dev: AxBlockDevice, region: PartitionRegion) -> VfsResult<Filesystem> {
         let ext4 = lwext4_rust::Ext4Filesystem::new(Ext4Disk::new(dev, region), EXT4_CONFIG)
+            .map_err(into_vfs_err)?;
+
+        let fs = Arc::new(Self {
+            inner: Mutex::new(ext4),
+            root_dir: OnceCell::new(),
+        });
+        let _ = fs.root_dir.set(DirEntry::new_dir(
+            |this| DirNode::new(Inode::new(fs.clone(), EXT4_ROOT_INO, Some(this))),
+            Reference::root(),
+        ));
+        Ok(Filesystem::new(fs))
+    }
+
+    /// Mount a secondary ext4 on a block device shared behind [`Arc<Mutex<_>>`].
+    pub fn new_shared(
+        dev: Arc<AxSyncMutex<AxBlockDevice>>,
+        region: PartitionRegion,
+    ) -> VfsResult<Filesystem> {
+        let ext4 = lwext4_rust::Ext4Filesystem::new(Ext4Disk::new_shared(dev, region), EXT4_CONFIG)
             .map_err(into_vfs_err)?;
 
         let fs = Arc::new(Self {
