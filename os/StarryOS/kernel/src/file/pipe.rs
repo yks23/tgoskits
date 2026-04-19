@@ -43,6 +43,10 @@ pub struct Pipe {
 }
 impl Drop for Pipe {
     fn drop(&mut self) {
+        // Closing the write end must unblock readers waiting on an empty buffer.
+        if self.is_write() {
+            self.shared.poll_rx.wake();
+        }
         self.shared.poll_close.wake();
     }
 }
