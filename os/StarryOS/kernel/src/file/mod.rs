@@ -236,7 +236,7 @@ pub fn close_file_like(fd: c_int) -> AxResult {
             if let Ok(st) = arc_file.stat() {
                 let key = (st.dev, st.ino);
                 flock::on_last_file_ref_drop(key, &f.inner);
-                record_lock::release_ofd(Arc::as_ptr(&f.inner) as usize);
+                record_lock::release_ofd(Arc::as_ptr(&f.inner) as *const () as usize);
             }
         }
     }

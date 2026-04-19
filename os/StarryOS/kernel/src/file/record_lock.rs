@@ -1,6 +1,6 @@
 //! POSIX / OFD byte-range record locks (`fcntl`).
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 
 use ax_errno::{AxError, AxResult};
 use ax_kspin::SpinNoIrq;
@@ -46,7 +46,9 @@ impl RLInode {
     }
 }
 
-static RECORD_INODES: SpinNoIrq<HashMap<InodeKey, Arc<Mutex<RLInode>>>> = SpinNoIrq::new(HashMap::new());
+lazy_static::lazy_static! {
+    static ref RECORD_INODES: SpinNoIrq<HashMap<InodeKey, Arc<Mutex<RLInode>>>> = SpinNoIrq::new(HashMap::new());
+}
 
 fn bucket(key: InodeKey) -> Arc<Mutex<RLInode>> {
     let mut g = RECORD_INODES.lock();
@@ -110,8 +112,9 @@ fn punch_owner_range(segs: &mut Vec<Seg>, owner: RLOwner, range: (u64, u64)) {
             }
         }
         if s.end > range.1 {
+            let s_start = s.start;
             let mut right = s;
-            right.start = range.1.max(s.start);
+            right.start = range.1.max(s_start);
             if right.start < right.end {
                 out.push(right);
             }
@@ -153,17 +156,25 @@ fn would_block_without_change(
 }
 
 fn maybe_remove_bucket(key: InodeKey, b: &Arc<Mutex<RLInode>>) {
-    if let Ok(ino) = b.try_lock() {
+    if let Some(ino) = b.try_lock() {
         if ino.segs.is_empty() && ino.wq.is_empty() {
             drop(ino);
             let mut g = RECORD_INODES.lock();
-            if let Some(ent) = g.get(&key)
-                && Arc::ptr_eq(ent, b)
-                && let Ok(ino2) = ent.try_lock()
-                && ino2.segs.is_empty()
-                && ino2.wq.is_empty()
-            {
-                drop(ino2);
+            let should_remove = if let Some(ent) = g.get(&key) {
+                if Arc::ptr_eq(ent, b)
+                    && let Some(ino2) = ent.try_lock()
+                    && ino2.segs.is_empty()
+                    && ino2.wq.is_empty()
+                {
+                    drop(ino2);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_remove {
                 g.remove(&key);
             }
         }

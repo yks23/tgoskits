@@ -1,6 +1,6 @@
 //! BSD `flock(2)` advisory locks, keyed by `(st_dev, st_ino)` and open file description.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 
 use ax_errno::{AxError, AxResult};
 use ax_kspin::SpinNoIrq;
@@ -126,7 +126,9 @@ impl FlockInode {
     }
 }
 
-static FLOCK_INODES: SpinNoIrq<HashMap<InodeKey, Arc<Mutex<FlockInode>>>> = SpinNoIrq::new(HashMap::new());
+lazy_static::lazy_static! {
+    static ref FLOCK_INODES: SpinNoIrq<HashMap<InodeKey, Arc<Mutex<FlockInode>>>> = SpinNoIrq::new(HashMap::new());
+}
 
 fn bucket(key: InodeKey) -> Arc<Mutex<FlockInode>> {
     let mut g = FLOCK_INODES.lock();
@@ -136,17 +138,25 @@ fn bucket(key: InodeKey) -> Arc<Mutex<FlockInode>> {
 }
 
 fn maybe_remove_bucket(key: InodeKey, b: &Arc<Mutex<FlockInode>>) {
-    if let Ok(ino) = b.try_lock() {
+    if let Some(ino) = b.try_lock() {
         if matches!(ino.state, FlockState::Unlocked) && ino.wq.is_empty() {
             drop(ino);
             let mut g = FLOCK_INODES.lock();
-            if let Some(ent) = g.get(&key)
-                && Arc::ptr_eq(ent, b)
-                && let Ok(ino2) = ent.try_lock()
-                && matches!(ino2.state, FlockState::Unlocked)
-                && ino2.wq.is_empty()
-            {
-                drop(ino2);
+            let should_remove = if let Some(ent) = g.get(&key) {
+                if Arc::ptr_eq(ent, b)
+                    && let Some(ino2) = ent.try_lock()
+                    && matches!(ino2.state, FlockState::Unlocked)
+                    && ino2.wq.is_empty()
+                {
+                    drop(ino2);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_remove {
                 g.remove(&key);
             }
         }
@@ -156,7 +166,7 @@ fn maybe_remove_bucket(key: InodeKey, b: &Arc<Mutex<FlockInode>>) {
 /// Called from `close_file_like` when the last `Arc` reference to this file is about to be dropped.
 pub fn on_last_file_ref_drop(st: (u64, u64), file: &Arc<dyn super::FileLike>) {
     let owner = FlockOwner {
-        desc: Arc::as_ptr(file) as usize,
+        desc: Arc::as_ptr(file) as *const () as usize,
         pid: current().as_thread().proc_data.proc.pid(),
     };
     let key = st;
@@ -213,7 +223,7 @@ pub fn flock_inode(st: (u64, u64), file: &Arc<dyn super::FileLike>, operation: i
 
     let nb = op & LOCK_NB != 0;
     let owner = FlockOwner {
-        desc: Arc::as_ptr(file) as usize,
+        desc: Arc::as_ptr(file) as *const () as usize,
         pid: current().as_thread().proc_data.proc.pid(),
     };
     let key = st;

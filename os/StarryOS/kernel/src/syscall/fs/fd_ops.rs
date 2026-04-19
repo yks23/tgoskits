@@ -7,7 +7,7 @@ use core::{
 
 use ax_errno::{AxError, AxResult};
 use ax_fs::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
-use ax_io::SeekFrom;
+use ax_io::{Seek, SeekFrom};
 use ax_task::current;
 use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Reference};
 use bitflags::bitflags;
@@ -289,7 +289,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             let arc = get_file_like(fd)?;
             let fl = UserPtr::<flock64>::from(arg).get_as_mut()?;
             let range = resolve_record_range(&file, fl)?;
-            let owner = record_lock::RLOwner::Ofd(Arc::as_ptr(&arc) as usize);
+            let owner = record_lock::RLOwner::Ofd(Arc::as_ptr(&arc) as *const () as usize);
             let blocking = cmd as u32 == F_OFD_SETLKW;
             record_lock::setlk(key, owner, range, fl.l_type, blocking)?;
             Ok(0)
@@ -300,7 +300,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             let arc = get_file_like(fd)?;
             let ofd = cmd as u32 == F_OFD_GETLK;
             let owner = if ofd {
-                record_lock::RLOwner::Ofd(Arc::as_ptr(&arc) as usize)
+                record_lock::RLOwner::Ofd(Arc::as_ptr(&arc) as *const () as usize)
             } else {
                 record_lock::RLOwner::Posix(current().as_thread().proc_data.proc.pid())
             };
