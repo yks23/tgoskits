@@ -1,4 +1,4 @@
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
 use core::ffi::c_char;
 use core::task::Poll;
 
@@ -6,7 +6,8 @@ use ax_errno::{AxError, AxResult};
 use ax_fs::FS_CONTEXT;
 use ax_hal::uspace::UserContext;
 use ax_task::current;
-use ax_task::future::{block_on, interruptible, poll_fn};
+use ax_task::future::{block_on, interruptible};
+use core::future::poll_fn;
 use axfs_ng_vfs::Location;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
 use starry_process::Pid;
@@ -64,7 +65,7 @@ fn wait_execve_single_threaded(proc_data: &Arc<ProcessData>) -> AxResult<()> {
 
     block_on(interruptible(poll_fn(|cx| {
         if proc.threads().len() <= 1 {
-            Poll::Ready(Ok(()))
+            Poll::Ready(Ok::<(), AxError>(()))
         } else {
             proc_data.thread_group_wait.register(cx.waker());
             Poll::Pending
