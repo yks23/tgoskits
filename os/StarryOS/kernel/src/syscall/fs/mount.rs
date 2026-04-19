@@ -15,6 +15,7 @@ use crate::{
     file::{Directory, FD_TABLE, File},
     mm::vm_load_string,
     pseudofs::{MemoryFs, bind_mount::BindDirFilesystem},
+    task::AsThread,
 };
 
 /// `MS_BIND` from Linux `mount(2)`.
@@ -37,7 +38,8 @@ fn record_ext4_mount(mp: &Arc<Mountpoint>, disk_index: usize) {
 fn mountpoint_has_open_files(mp: &Arc<Mountpoint>) -> bool {
     let task = current();
     let scope = task.as_thread().proc_data.scope.read();
-    let table = FD_TABLE.scope(&scope).read();
+    let scoped_table = FD_TABLE.scope(&scope);
+    let table = scoped_table.read();
     for id in table.ids() {
         let Some(desc) = table.get(id) else {
             continue;
