@@ -1,5 +1,10 @@
 #!/bin/sh
 
+# F-α：fork/exec/wait 诊断；尽早 exec 进静态 bisect，避免与尾部 init hook patch 冲突。
+if [ -x /opt/selfhost-tests/test_bisect_1 ]; then
+	exec /opt/selfhost-tests/test_bisect_1
+fi
+
 export HOME=/root
 export USER=root
 export HOSTNAME=starry
