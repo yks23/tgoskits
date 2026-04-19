@@ -9,6 +9,11 @@ export HOME=/root
 export USER=root
 export HOSTNAME=starry
 
+# F-γ：pipe / dup2 / execve 诊断；仅当未注入 /opt/run-tests.sh 时才 exec，避免与 self-host 批量测试抢 init。
+if [ ! -x /opt/run-tests.sh ] && [ -x /opt/selfhost-tests/test_pipe_bisect_1 ]; then
+	exec /opt/selfhost-tests/test_pipe_bisect_1
+fi
+
 printf "Welcome to \033[96m\033[1mStarry OS\033[0m!\n"
 env
 echo
