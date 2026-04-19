@@ -25,4 +25,13 @@ echo
 
 cd "$HOME" || cd /
 export PS1='${USER}@${HOSTNAME}:${PWD} # '
+
+# Self-host test hook: 如果 rootfs 注入了 /opt/run-tests.sh，自动跑测试
+# 不依赖 stdin，跑完后 echo SELFHOST-DONE 然后退出。
+if [ -x /opt/run-tests.sh ]; then
+    /opt/run-tests.sh
+    echo "===SELFHOST-DONE==="
+    exit 0
+fi
+
 exec /bin/sh -i
