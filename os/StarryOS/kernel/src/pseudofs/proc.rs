@@ -9,13 +9,20 @@ use alloc::{
 };
 use core::{
     ffi::CStr,
+    fmt::Write as _,
     iter,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use ax_alloc::global_allocator;
+use ax_config::ARCH;
+use ax_hal::time::{monotonic_time, monotonic_time_nanos};
+use ax_sync::Mutex;
 use ax_task::{AxTaskRef, WeakAxTaskRef, current};
 use axfs_ng_vfs::{Filesystem, NodeType, VfsError, VfsResult};
 use indoc::indoc;
+use lazy_static::lazy_static;
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use starry_process::Process;
 
 use crate::{
@@ -27,65 +34,138 @@ use crate::{
     task::{AsThread, TaskStat, get_task, tasks},
 };
 
-const DUMMY_MEMINFO: &str = indoc! {"
-    MemTotal:       32536204 kB
-    MemFree:         5506524 kB
-    MemAvailable:   18768344 kB
-    Buffers:            3264 kB
-    Cached:         14454588 kB
-    SwapCached:            0 kB
-    Active:         18229700 kB
-    Inactive:        6540624 kB
-    Active(anon):   11380224 kB
-    Inactive(anon):        0 kB
-    Active(file):    6849476 kB
-    Inactive(file):  6540624 kB
-    Unevictable:      930088 kB
-    Mlocked:            1136 kB
-    SwapTotal:       4194300 kB
-    SwapFree:        4194300 kB
-    Zswap:                 0 kB
-    Zswapped:              0 kB
-    Dirty:             47952 kB
-    Writeback:             0 kB
-    AnonPages:      10992512 kB
-    Mapped:          1361184 kB
-    Shmem:           1068056 kB
-    KReclaimable:     341440 kB
-    Slab:             628996 kB
-    SReclaimable:     341440 kB
-    SUnreclaim:       287556 kB
-    KernelStack:       28704 kB
-    PageTables:        85308 kB
-    SecPageTables:      2084 kB
-    NFS_Unstable:          0 kB
-    Bounce:                0 kB
-    WritebackTmp:          0 kB
-    CommitLimit:    20462400 kB
-    Committed_AS:   45105316 kB
-    VmallocTotal:   34359738367 kB
-    VmallocUsed:      205924 kB
-    VmallocChunk:          0 kB
-    Percpu:            23840 kB
-    HardwareCorrupted:     0 kB
-    AnonHugePages:   1417216 kB
-    ShmemHugePages:        0 kB
-    ShmemPmdMapped:        0 kB
-    FileHugePages:    477184 kB
-    FilePmdMapped:    288768 kB
-    CmaTotal:              0 kB
-    CmaFree:               0 kB
-    Unaccepted:            0 kB
-    HugePages_Total:       0
-    HugePages_Free:        0
-    HugePages_Rsvd:        0
-    HugePages_Surp:        0
-    Hugepagesize:       2048 kB
-    Hugetlb:               0 kB
-    DirectMap4k:     1739900 kB
-    DirectMap2M:    31492096 kB
-    DirectMap1G:     1048576 kB
-"};
+const KERNEL_PAGE_SIZE: usize = 4096;
+
+fn proc_mounts_text() -> &'static str {
+    "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
+     devtmpfs /dev devtmpfs rw,nosuid,relatime,size=65536k,mode=755 0 0\n\
+     tmpfs /tmp tmpfs rw,nosuid,nodev,relatime 0 0\n\
+     sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
+     /dev/root / ext4 rw,relatime 0 0\n"
+}
+
+fn proc_filesystems_text() -> &'static str {
+    "nodev\tsysfs\n\
+     nodev\ttmpfs\n\
+     nodev\tproc\n\
+     \text4\n"
+}
+
+fn format_meminfo() -> String {
+    let ga = global_allocator();
+    let total_pages = ga.used_pages() + ga.available_pages();
+    let free_pages = ga.available_pages();
+    let total_kb = total_pages.saturating_mul(KERNEL_PAGE_SIZE) / 1024;
+    let memfree_kb = free_pages.saturating_mul(KERNEL_PAGE_SIZE) / 1024;
+    let heap_avail_kb = ga.available_bytes() / 1024;
+    let memavail_kb = memfree_kb.saturating_add(heap_avail_kb).min(total_kb);
+    format!(
+        "MemTotal:       {total_kb} kB\n\
+         MemFree:        {memfree_kb} kB\n\
+         MemAvailable:   {memavail_kb} kB\n\
+         SwapTotal:             0 kB\n\
+         SwapFree:              0 kB\n",
+    )
+}
+
+fn format_cpuinfo() -> String {
+    let mut s = String::new();
+    let n = ax_hal::cpu_num().max(1);
+    for i in 0..n {
+        let _ = writeln!(s, "processor\t: {i}");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = writeln!(s, "model name\t: QEMU Virtual CPU @ 2.0GHz");
+            let _ = writeln!(
+                s,
+                "flags\t\t: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 mmx fxsr sse sse2 ss ht"
+            );
+        }
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        {
+            #[cfg(target_arch = "riscv64")]
+            let _ = writeln!(s, "isa\t\t: rv64gc");
+            #[cfg(target_arch = "riscv32")]
+            let _ = writeln!(s, "isa\t\t: rv32gc");
+            #[cfg(target_arch = "riscv64")]
+            let _ = writeln!(s, "mmu\t\t: sv48");
+            #[cfg(target_arch = "riscv32")]
+            let _ = writeln!(s, "mmu\t\t: sv32");
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "riscv32",
+            target_arch = "riscv64"
+        )))]
+        {
+            let _ = writeln!(s, "model name\t: StarryOS virtual CPU");
+            let _ = writeln!(s, "flags\t\t:");
+        }
+    }
+    s
+}
+
+fn format_proc_version() -> String {
+    format!("Linux version 10.0.0 (starry@starry) ({ARCH}) #1 SMP\n")
+}
+
+fn format_uptime() -> String {
+    let t = monotonic_time();
+    format!("{}.{:06} 0.00\n", t.as_secs(), t.subsec_micros())
+}
+
+fn format_loadavg() -> String {
+    let n = tasks().len().max(1);
+    format!("0.00 0.00 0.00 {n}/{n} {n}\n")
+}
+
+fn format_uuid_dashed(bytes: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
+fn proc_random_uuid_line() -> String {
+    let mut b = [0u8; 16];
+    PROC_RNG.lock().fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!("{}\n", format_uuid_dashed(&b))
+}
+
+fn proc_boot_id_line() -> String {
+    let mut g = PROC_BOOT_ID.lock();
+    if g.is_none() {
+        let mut b = [0u8; 16];
+        PROC_RNG.lock().fill_bytes(&mut b);
+        *g = Some(format!("{}\n", format_uuid_dashed(&b)));
+    }
+    g.clone().unwrap()
+}
+
+lazy_static! {
+    static ref PROC_RNG: Mutex<SmallRng> = Mutex::new(SmallRng::seed_from_u64(
+        monotonic_time_nanos() as u64 ^ 0x6eed_0e9d_eadb_eef1u64,
+    ));
+}
+
+static PROC_BOOT_ID: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn new_procfs() -> Filesystem {
     SimpleFs::new_with("proc".into(), 0x9fa0, builder)
@@ -259,7 +339,7 @@ impl SimpleDirOps for ThreadDir {
             })
             .into(),
             "mounts" => SimpleFile::new_regular(fs, move || {
-                Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
+                Ok(proc_mounts_text())
             })
             .into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {
@@ -360,13 +440,31 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DirMapping::new();
     root.add(
         "mounts",
-        SimpleFile::new_regular(fs.clone(), || {
-            Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
-        }),
+        SimpleFile::new_regular(fs.clone(), || Ok(proc_mounts_text())),
     );
     root.add(
         "meminfo",
-        SimpleFile::new_regular(fs.clone(), || Ok(DUMMY_MEMINFO)),
+        SimpleFile::new_regular(fs.clone(), || Ok(format_meminfo())),
+    );
+    root.add(
+        "cpuinfo",
+        SimpleFile::new_regular(fs.clone(), || Ok(format_cpuinfo())),
+    );
+    root.add(
+        "loadavg",
+        SimpleFile::new_regular(fs.clone(), || Ok(format_loadavg())),
+    );
+    root.add(
+        "uptime",
+        SimpleFile::new_regular(fs.clone(), || Ok(format_uptime())),
+    );
+    root.add(
+        "version",
+        SimpleFile::new_regular(fs.clone(), || Ok(format_proc_version())),
+    );
+    root.add(
+        "filesystems",
+        SimpleFile::new_regular(fs.clone(), || Ok(proc_filesystems_text())),
     );
     root.add(
         "meminfo2",
@@ -412,6 +510,20 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             kernel.add(
                 "pid_max",
                 SimpleFile::new_regular(fs.clone(), || Ok("32768\n")),
+            );
+
+            let mut random = DirMapping::new();
+            random.add(
+                "uuid",
+                SimpleFile::new_regular(fs.clone(), || Ok(proc_random_uuid_line())),
+            );
+            random.add(
+                "boot_id",
+                SimpleFile::new_regular(fs.clone(), || Ok(proc_boot_id_line())),
+            );
+            kernel.add(
+                "random",
+                SimpleDir::new_maker(fs.clone(), Arc::new(random)),
             );
 
             SimpleDir::new_maker(fs.clone(), Arc::new(kernel))
