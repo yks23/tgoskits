@@ -53,16 +53,40 @@ pub fn sys_umask(mask: u32) -> AxResult<isize> {
     Ok(old as isize)
 }
 
-pub fn sys_setreuid(_ruid: u32, _euid: u32) -> AxResult<isize> {
+pub fn sys_setreuid(ruid: u32, euid: u32) -> AxResult<isize> {
+    let task = current();
+    let pd = task.as_thread().proc_data.as_ref();
+    let suid = pd.res_uids().2;
+    pd.set_res_uids(ruid, euid, suid);
     Ok(0)
 }
 
-pub fn sys_setresuid(_ruid: u32, _euid: u32, _suid: u32) -> AxResult<isize> {
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> AxResult<isize> {
+    current()
+        .as_thread()
+        .proc_data
+        .set_res_uids(ruid, euid, suid);
     Ok(0)
 }
 
-pub fn sys_setresgid(_rgid: u32, _egid: u32, _sgid: u32) -> AxResult<isize> {
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
+    current()
+        .as_thread()
+        .proc_data
+        .set_res_gids(rgid, egid, sgid);
     Ok(0)
+}
+
+/// `personality(2)` — minimal ABI: `0xFFFFFFFF` queries, otherwise set and return previous.
+pub fn sys_personality(persona: u32) -> AxResult<isize> {
+    const QUERY: u32 = !0;
+    let task = current();
+    let pd = task.as_thread().proc_data.as_ref();
+    if persona == QUERY {
+        return Ok(pd.personality() as isize);
+    }
+    let old = pd.set_personality(persona);
+    Ok(old as isize)
 }
 
 pub fn sys_get_mempolicy(

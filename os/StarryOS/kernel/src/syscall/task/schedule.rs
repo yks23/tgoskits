@@ -11,7 +11,7 @@ use linux_raw_sys::general::{
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
-    task::{get_process_data, get_process_group},
+    task::{get_process_data, get_process_group, AsThread},
     time::TimeValueLike,
 };
 
@@ -144,10 +144,12 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
 
     match which {
         PRIO_PROCESS => {
-            if who != 0 {
-                let _proc = get_process_data(who)?;
-            }
-            Ok(20)
+            let pd = if who == 0 {
+                current().as_thread().proc_data.clone()
+            } else {
+                get_process_data(who)?
+            };
+            Ok((pd.proc_nice() + 20) as isize)
         }
         PRIO_PGRP => {
             if who != 0 {
@@ -162,6 +164,32 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
                 Err(AxError::NoSuchProcess)
             }
         }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+pub fn sys_setpriority(which: u32, who: u32, nice: i32) -> AxResult<isize> {
+    debug!("sys_setpriority <= which: {which}, who: {who}, nice: {nice}");
+    if !(-20..=19).contains(&nice) {
+        return Err(AxError::InvalidInput);
+    }
+    match which {
+        PRIO_PROCESS => {
+            let pd = if who == 0 {
+                current().as_thread().proc_data.clone()
+            } else {
+                get_process_data(who)?
+            };
+            pd.store_proc_nice(nice);
+            Ok(0)
+        }
+        PRIO_PGRP => {
+            if who != 0 {
+                let _pg = get_process_group(who)?;
+            }
+            Ok(0)
+        }
+        PRIO_USER => Err(AxError::InvalidInput),
         _ => Err(AxError::InvalidInput),
     }
 }

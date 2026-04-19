@@ -8,24 +8,25 @@ use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM},
     system::{new_utsname, sysinfo},
 };
-use starry_vm::{VmMutPtr, vm_write_slice};
+use ax_task::current;
+use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
-use crate::task::processes;
+use crate::task::{processes, AsThread};
 
 pub fn sys_getuid() -> AxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.res_uids().0 as isize)
 }
 
 pub fn sys_geteuid() -> AxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.res_uids().1 as isize)
 }
 
 pub fn sys_getgid() -> AxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.res_gids().0 as isize)
 }
 
 pub fn sys_getegid() -> AxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.res_gids().1 as isize)
 }
 
 pub fn sys_setuid(_uid: u32) -> AxResult<isize> {
@@ -35,6 +36,34 @@ pub fn sys_setuid(_uid: u32) -> AxResult<isize> {
 
 pub fn sys_setgid(_gid: u32) -> AxResult<isize> {
     debug!("sys_setgid <= gid: {_gid}");
+    Ok(0)
+}
+
+pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> AxResult<isize> {
+    let (r, e, s) = current().as_thread().proc_data.res_uids();
+    if let Some(p) = ruid.nullable() {
+        p.vm_write(r)?;
+    }
+    if let Some(p) = euid.nullable() {
+        p.vm_write(e)?;
+    }
+    if let Some(p) = suid.nullable() {
+        p.vm_write(s)?;
+    }
+    Ok(0)
+}
+
+pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> AxResult<isize> {
+    let (r, e, s) = current().as_thread().proc_data.res_gids();
+    if let Some(p) = rgid.nullable() {
+        p.vm_write(r)?;
+    }
+    if let Some(p) = egid.nullable() {
+        p.vm_write(e)?;
+    }
+    if let Some(p) = sgid.nullable() {
+        p.vm_write(s)?;
+    }
     Ok(0)
 }
 
