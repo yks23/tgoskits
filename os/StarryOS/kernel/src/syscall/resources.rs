@@ -51,7 +51,7 @@ pub fn sys_prlimit64(
         let hard_cap = if resource == RLIMIT_NOFILE as u32 {
             AX_FILE_LIMIT as u64
         } else {
-            RLIM64_INFINITY
+            RLIM64_INFINITY as u64
         };
 
         let mut rlim = proc_data.rlim.write();
@@ -61,7 +61,7 @@ pub fn sys_prlimit64(
             if resource == RLIMIT_NOFILE as u32 {
                 hard_cap
             } else {
-                RLIM64_INFINITY
+                RLIM64_INFINITY as u64
             }
         } else {
             let capped = if rlim_is_infinite(hard_cap) {

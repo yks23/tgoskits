@@ -8,7 +8,11 @@ use linux_raw_sys::general::{
 };
 
 /// Maximum FD slots in the per-process table (RLIMIT_NOFILE hard cap).
-pub const AX_FILE_LIMIT: usize = 8192;
+// 注意：bitmaps crate 默认只支持 BitsImpl<N> N<=1024，超过会编译失败。
+// flatten_objects 用 bitmaps，故 AX_FILE_LIMIT 上限是 1024。
+// 自我编译实际用 cargo / rustc 经验上 1024 fd 已足，只是没法跑大并行 -j16+ 编译。
+// 如果后续真要更高，需要改 bitmaps 或换 flatten_objects 实现。
+pub const AX_FILE_LIMIT: usize = 1024;
 
 /// Default soft limit for open file descriptors.
 pub const AX_FILE_LIMIT_SOFT: u64 = 4096;
@@ -89,5 +93,5 @@ impl IndexMut<u32> for Rlimits {
 /// `true` if `v` means unlimited for rlimit64 values.
 #[inline]
 pub fn rlim_is_infinite(v: u64) -> bool {
-    v == RLIM64_INFINITY || v == u64::MAX
+    v == RLIM64_INFINITY as u64 || v == u64::MAX
 }
