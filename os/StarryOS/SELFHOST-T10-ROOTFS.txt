@@ -1,0 +1,3 @@
+T10 (Auto-OS selfhost): Alpine musl rootfs 镜像构建脚本位于 Auto-OS 仓
+tests/selfhost/build-selfhost-rootfs.sh；说明见 tests/selfhost/SELFHOST-ROOTFS.md。
+本文件仅为 patches/T10 提供非空 git am 载体，不含内核行为变更。
