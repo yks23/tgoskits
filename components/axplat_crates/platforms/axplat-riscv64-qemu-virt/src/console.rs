@@ -41,8 +41,17 @@ impl ConsoleIf for ConsoleIfImpl {
     }
 
     /// Returns the IRQ number for the console, if applicable.
+    ///
+    /// QEMU virt 的 16550 虽有 PLIC 号，但 Starry `/dev/console` 走 `LineDiscipline`
+    /// 的 [`ProcessMode::External`] 时需要 **设备 IRQ 已挂 top-half** 才会在 `tty-reader`
+    /// 任务里 `poll()` UART。当前内核不为 UART 注册 `ax_hal::irq::register` 处理函数，
+    /// `register_irq_waker` 只 `set_enable` PLIC：中断到达后表项为空、硬件电平可能
+    /// 无法清掉，RX 字节一直留在 FIFO，`tty-reader` 永远不被唤醒。
+    ///
+    /// 退回与 x86 COM1 相同的策略：`irq_num = None` → `ProcessMode::Manual`，在
+    /// `read(0,…)` 路径里轮询 `console::read_bytes`，stdin 即可工作。
     #[cfg(feature = "irq")]
     fn irq_num() -> Option<usize> {
-        Some(crate::config::devices::UART_IRQ)
+        None
     }
 }
