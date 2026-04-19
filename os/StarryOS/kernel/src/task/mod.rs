@@ -244,6 +244,17 @@ pub struct ProcessData {
 
     /// The default mask for file permissions.
     umask: AtomicU32,
+
+    /// Linux `personality(2)` domain; default `PER_LINUX` (0).
+    personality: AtomicU32,
+    /// Process nice value (`setpriority` / `getpriority` semantics), default 0.
+    proc_nice: AtomicI32,
+    ruid: AtomicU32,
+    euid: AtomicU32,
+    suid: AtomicU32,
+    rgid: AtomicU32,
+    egid: AtomicU32,
+    sgid: AtomicU32,
 }
 
 impl ProcessData {
@@ -279,6 +290,15 @@ impl ProcessData {
             futex_table: Arc::new(FutexTable::new()),
 
             umask: AtomicU32::new(0o022),
+
+            personality: AtomicU32::new(0),
+            proc_nice: AtomicI32::new(0),
+            ruid: AtomicU32::new(0),
+            euid: AtomicU32::new(0),
+            suid: AtomicU32::new(0),
+            rgid: AtomicU32::new(0),
+            egid: AtomicU32::new(0),
+            sgid: AtomicU32::new(0),
         })
     }
 
@@ -311,5 +331,57 @@ impl ProcessData {
     /// Set the umask and return the old value.
     pub fn replace_umask(&self, umask: u32) -> u32 {
         self.umask.swap(umask, Ordering::SeqCst)
+    }
+
+    pub fn personality(&self) -> u32 {
+        self.personality.load(Ordering::Relaxed)
+    }
+
+    pub fn set_personality(&self, value: u32) -> u32 {
+        self.personality.swap(value, Ordering::Relaxed)
+    }
+
+    pub fn store_personality(&self, value: u32) {
+        self.personality.store(value, Ordering::Relaxed);
+    }
+
+    pub fn proc_nice(&self) -> i32 {
+        self.proc_nice.load(Ordering::Relaxed)
+    }
+
+    pub fn set_proc_nice(&self, nice: i32) -> i32 {
+        self.proc_nice.swap(nice, Ordering::Relaxed)
+    }
+
+    pub fn store_proc_nice(&self, nice: i32) {
+        self.proc_nice.store(nice, Ordering::Relaxed);
+    }
+
+    pub fn res_uids(&self) -> (u32, u32, u32) {
+        (
+            self.ruid.load(Ordering::Relaxed),
+            self.euid.load(Ordering::Relaxed),
+            self.suid.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn set_res_uids(&self, ruid: u32, euid: u32, suid: u32) {
+        self.ruid.store(ruid, Ordering::Relaxed);
+        self.euid.store(euid, Ordering::Relaxed);
+        self.suid.store(suid, Ordering::Relaxed);
+    }
+
+    pub fn res_gids(&self) -> (u32, u32, u32) {
+        (
+            self.rgid.load(Ordering::Relaxed),
+            self.egid.load(Ordering::Relaxed),
+            self.sgid.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn set_res_gids(&self, rgid: u32, egid: u32, sgid: u32) {
+        self.rgid.store(rgid, Ordering::Relaxed);
+        self.egid.store(egid, Ordering::Relaxed);
+        self.sgid.store(sgid, Ordering::Relaxed);
     }
 }
