@@ -110,7 +110,12 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
             Some(res) => Poll::Ready(res),
             None => {
                 proc_data.child_exit_event.register(cx.waker());
-                Poll::Pending
+                // 关闭「检查 → 注册 waker」之间的丢唤醒窗口：子进程可能恰好在
+                // 这两步之间退出并 child_exit_event.wake()（当时尚无 waiter）。
+                match check_children().transpose() {
+                    Some(res) => Poll::Ready(res),
+                    None => Poll::Pending,
+                }
             }
         }
     })))?
