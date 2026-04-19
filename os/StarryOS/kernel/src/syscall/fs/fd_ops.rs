@@ -1,17 +1,21 @@
 use alloc::{format, string::ToString, sync::Arc};
 use core::{
     ffi::{c_char, c_int},
-    mem,
+    mem::{self, size_of},
     ops::{Deref, DerefMut},
 };
 
-use ax_errno::{AxError, AxResult};
+use ax_errno::{AxError, AxResult, LinuxError};
 use ax_fs::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
 use ax_io::{Seek, SeekFrom};
 use ax_task::current;
-use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Reference};
+use starry_vm::VmPtr;
+use axfs_ng_vfs::{
+    path::Path,
+    DirEntry, FileNode, Location, NodePermission, NodeType, Reference,
+};
 use bitflags::bitflags;
-use linux_raw_sys::general::*;
+use linux_raw_sys::general::{open_how, RESOLVE_BENEATH, *};
 
 use crate::{
     file::{
@@ -129,6 +133,60 @@ pub fn sys_openat(
     let options = flags_to_options(flags, mode, (sys_geteuid()? as _, sys_getegid()? as _));
     with_fs(dirfd, |fs| options.open(fs, path))
         .and_then(|it| add_to_fd(it, flags as _))
+        .map(|fd| fd as isize)
+}
+
+fn path_lexically_stays_beneath(rel: &str) -> bool {
+    let mut depth = 0i32;
+    for comp in rel.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    true
+}
+
+/// `openat2(2)` — subset: `resolve == 0` behaves like `openat`; `RESOLVE_BENEATH` rejects
+/// absolute paths and lexical `..` escapes beyond `dirfd`.
+pub fn sys_openat2(
+    dirfd: c_int,
+    pathname: *const c_char,
+    how: *const open_how,
+    hsize: usize,
+) -> AxResult<isize> {
+    if how.is_null() || hsize < size_of::<open_how>() {
+        return Err(AxError::InvalidInput);
+    }
+    let how = unsafe { how.vm_read_uninit()?.assume_init() };
+    let resolve = how.resolve;
+    if resolve != 0 && resolve != RESOLVE_BENEATH as u64 {
+        return Err(AxError::InvalidInput);
+    }
+    if resolve == 0 {
+        return sys_openat(dirfd, pathname, how.flags as i32, how.mode as __kernel_mode_t);
+    }
+
+    let path = vm_load_string(pathname)?;
+    debug!("sys_openat2 <= {dirfd} {path:?} flags={:#x} resolve={resolve}", how.flags);
+    if Path::new(path.as_str()).is_absolute() || !path_lexically_stays_beneath(path.as_str()) {
+        return Err(AxError::from(LinuxError::EACCES));
+    }
+
+    let mode = (how.mode as __kernel_mode_t) & !current().as_thread().proc_data.umask();
+    let options = flags_to_options(
+        how.flags as i32,
+        mode,
+        (sys_geteuid()? as _, sys_getegid()? as _),
+    );
+    with_fs(dirfd, |fs| options.open(fs, path))
+        .and_then(|it| add_to_fd(it, how.flags as _))
         .map(|fd| fd as isize)
 }
 
