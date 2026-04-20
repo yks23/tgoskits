@@ -287,10 +287,25 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
         .ok_or(AxError::BadFileDescriptor)?;
     f.cloexec = flags.contains(Dup3Flags::O_CLOEXEC);
 
-    let _ = close_file_like(new_fd);
+    // 直接 remove（不能调 close_file_like，它会再 lock FD_TABLE 死锁）
+    let removed = fd_table.remove(new_fd as _);
     fd_table
         .add_at(new_fd as _, f)
         .map_err(|_| AxError::BadFileDescriptor)?;
+    drop(fd_table);
+    // 锁释放后做 lock-cleanup（避免持锁时调 record_lock/flock 又拿别的锁）
+    if let Some(old) = removed {
+        let sc = Arc::strong_count(&old.inner);
+        if sc == 1 {
+            if let Ok(arc_file) = old.inner.clone().downcast_arc::<File>() {
+                if let Ok(st) = arc_file.stat() {
+                    let key = (st.dev, st.ino);
+                    flock::on_last_file_ref_drop(key, &old.inner);
+                    record_lock::release_ofd(Arc::as_ptr(&old.inner) as *const () as usize);
+                }
+            }
+        }
+    }
 
     Ok(new_fd as _)
 }
