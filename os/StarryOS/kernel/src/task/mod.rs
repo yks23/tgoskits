@@ -87,6 +87,13 @@ pub struct Thread {
     /// The registered rseq area pointer (user address) for restartable
     /// sequences.
     rseq_area: AtomicUsize,
+
+    /// Set when the thread was created via `clone(CLONE_VFORK)` or `vfork(2)`.
+    /// While non-`None`, the parent task is blocked on this `PollSet` waiting
+    /// for the child to release its hold on the parent's address space (i.e.
+    /// to call `execve(2)` or `_exit(2)`). The child wakes & clears it on
+    /// either of those events.
+    pub vfork_done: spin::Mutex<Option<Arc<PollSet>>>,
 }
 
 impl Thread {
@@ -104,7 +111,17 @@ impl Thread {
             accessing_user_memory: AtomicBool::new(false),
             exit_event: Arc::default(),
             rseq_area: AtomicUsize::new(0),
+            vfork_done: spin::Mutex::new(None),
         })
+    }
+
+    /// Take the vfork-done PollSet (consumes it) and wake whoever is waiting.
+    /// Called from `execve` (after the new image is loaded) and from `do_exit`
+    /// to release the vfork parent.
+    pub fn release_vfork_parent(&self) {
+        if let Some(ev) = self.vfork_done.lock().take() {
+            ev.wake();
+        }
     }
 
     /// Get the clear child tid field.
@@ -258,6 +275,27 @@ pub struct ProcessData {
 }
 
 impl ProcessData {
+    /// Replace the `Arc<Mutex<AddrSpace>>` slot with a brand-new one. Used by
+    /// `execve(2)` after a CLONE_VFORK clone, so the child can detach from the
+    /// parent's address space before loading the new ELF.
+    ///
+    /// # Safety
+    /// Caller must guarantee that no other thread of this process is currently
+    /// using `self.aspace` (or about to start). For the vfork case this holds
+    /// because vfork forbids CLONE_THREAD and the parent is blocked in
+    /// `do_clone()` until the child wakes it.
+    pub unsafe fn replace_aspace(&self, new: Arc<Mutex<AddrSpace>>) {
+        // Cast through a raw pointer obtained from the field's address; we
+        // intentionally bypass aliasing rules here, justified by the SAFETY
+        // contract above. Use `addr_of` to avoid creating an intermediate
+        // `&T` reference that would trip Rust's aliasing model lints.
+        let slot = core::ptr::addr_of!(self.aspace) as *mut Arc<Mutex<AddrSpace>>;
+        unsafe {
+            core::ptr::drop_in_place(slot);
+            core::ptr::write(slot, new);
+        }
+    }
+
     /// Create a new [`ProcessData`].
     pub fn new(
         proc: Arc<Process>,

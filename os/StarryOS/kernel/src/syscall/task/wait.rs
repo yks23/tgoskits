@@ -237,9 +237,10 @@ pub fn sys_waitid(
                 proc_data.child_exit_event.register(cx.waker());
                 // 关闭「检查 → 注册 waker」之间的丢唤醒窗口：子进程可能恰好在
                 // 这两步之间退出并 child_exit_event.wake()（当时尚无 waiter）。
-                match check_children().transpose() {
-                    Some(res) => Poll::Ready(res),
-                    None => Poll::Pending,
+                match wait_children(proc, which, options, core::ptr::null_mut(), infop) {
+                    Ok(WaitPoll::Found { .. }) | Ok(WaitPoll::NoHang) => Poll::Ready(Ok(0)),
+                    Ok(WaitPoll::Pending) => Poll::Pending,
+                    Err(e) => Poll::Ready(Err(e)),
                 }
             }
             Err(e) => Poll::Ready(Err(e)),

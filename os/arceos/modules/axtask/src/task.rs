@@ -461,6 +461,18 @@ impl TaskInner {
         self.ctx.get()
     }
 
+    /// Returns a raw mutable pointer to the saved task context.
+    ///
+    /// This is intended for in-kernel callers (e.g. `execve` for vfork
+    /// detach) that need to update the context's saved page-table root so
+    /// that the next context switch picks up the change. Caller must ensure
+    /// no other thread is concurrently performing a context switch on this
+    /// task.
+    #[inline]
+    pub unsafe fn ctx_mut_raw(&self) -> *mut TaskContext {
+        self.ctx.get()
+    }
+
     /// Set the CPU ID where the task is running or will run.
     #[cfg(feature = "smp")]
     #[inline]

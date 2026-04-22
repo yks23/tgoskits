@@ -97,6 +97,43 @@ fn apply_execve_image(
         }
     };
 
+    // CLONE_VFORK semantics: if our address space is currently shared with
+    // the (vfork) parent, we MUST detach into a fresh, empty address space
+    // before we touch any mappings — otherwise load_user_app's `uspace.clear()`
+    // would wipe the parent's mappings out from under it (parent SEGVs the
+    // moment it returns from the clone() syscall).
+    // CLONE_VFORK / CLONE_VM child detach: if our address space is currently
+    // shared with the parent, we MUST migrate to a fresh, empty address space
+    // before load_user_app() invalidates it (load_user_app calls
+    // `uspace.clear()` which would wipe the parent's mappings out from under
+    // it). Detection: Arc strong_count > 1 means the parent still holds it.
+    if Arc::strong_count(&proc_data.aspace) > 1 {
+        let mut new_aspace = crate::mm::new_user_aspace_empty()?;
+        // RISC-V & x86_64 share one SATP for kernel + user, so we must copy
+        // the kernel half into the new page table before activating it.
+        crate::mm::copy_from_kernel(&mut new_aspace)?;
+        let new_pt_root = new_aspace.page_table_root();
+        let new_arc = Arc::new(ax_sync::Mutex::new(new_aspace));
+        // SAFETY: vfork forbids CLONE_THREAD, so this ProcessData has no
+        // sibling thread that could race us on the aspace slot. The parent
+        // is in a separate ProcessData entirely (CLONE_VFORK does not share
+        // ProcessData with the parent).
+        unsafe { proc_data.replace_aspace(new_arc); }
+        // Update both the live SATP (so we can keep running this syscall in
+        // the new aspace) AND the saved task context's satp (so the next
+        // context-switch back to us doesn't think the satp is unchanged and
+        // skip the actual write).
+        unsafe { ax_hal::asm::write_user_page_table(new_pt_root); }
+        ax_hal::asm::flush_tlb(None);
+        unsafe {
+            // SAFETY: ctx_mut_ptr is a stable pointer; we are the only thread
+            // of this process (vfork/exec single-thread invariant) and we are
+            // running on this very task, so no concurrent context switch is
+            // touching `ctx`.
+            (*ax_task::current().ctx_mut_raw()).set_page_table_root(new_pt_root);
+        }
+    }
+
     let mut aspace = proc_data.aspace.lock();
     let (entry_point, user_stack_base) =
         load_user_app(&mut aspace, Some(load_path), &args, &envs, stack_bytes)?;
@@ -119,13 +156,18 @@ fn apply_execve_image(
         .ids()
         .filter(|it| fd_table.get(*it).unwrap().cloexec)
         .collect::<Vec<_>>();
+    drop(fd_table);
     for fd in cloexec_fds {
         let _ = close_file_like(fd as c_int);
     }
-    drop(fd_table);
 
     uctx.set_ip(entry_point.as_usize());
     uctx.set_sp(user_stack_base.as_usize());
+
+    // CLONE_VFORK semantics: the child has now installed a brand-new image,
+    // so release the vfork parent (no-op when not a vfork child).
+    curr.as_thread().release_vfork_parent();
+
     Ok(0)
 }
 

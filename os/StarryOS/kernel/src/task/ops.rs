@@ -217,6 +217,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
 
     info!("{} exit with code: {}", curr.id_name(), exit_code);
 
+    // CLONE_VFORK: if our parent is blocked on us, release it now.
+    // Safe to call multiple times — release_vfork_parent() takes() the slot.
+    thr.release_vfork_parent();
+
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
     if clear_child_tid.vm_write(0).is_ok() {
         let key = FutexKey::new_current(clear_child_tid as usize);

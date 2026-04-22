@@ -1,10 +1,16 @@
 use alloc::sync::Arc;
+use core::{future::poll_fn, task::Poll};
 
 use ax_errno::{AxError, AxResult};
 use ax_fs::FS_CONTEXT;
 use ax_hal::uspace::UserContext;
 use ax_kspin::SpinNoIrq;
-use ax_task::{AxTaskExt, current, spawn_task};
+use ax_task::{
+    AxTaskExt, current,
+    future::{block_on, interruptible},
+    spawn_task,
+};
+use axpoll::PollSet;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
 use starry_process::Pid;
@@ -147,9 +153,27 @@ impl CloneArgs {
             pidfd,
         } = self;
 
-        if flags.contains(CloneFlags::VFORK) {
-            debug!("do_clone: CLONE_VFORK slow path");
-            flags.remove(CloneFlags::VM);
+        // CLONE_VFORK semantics:
+        //
+        // We need to support two callers:
+        //   (a) bare vfork(2): clone(CLONE_VFORK|CLONE_VM|SIGCHLD, stack=0).
+        //       The child runs on the *parent's* user stack, so the parent
+        //       MUST block until the child execve()s or _exit()s; otherwise
+        //       parent and child stomp on the same stack.
+        //   (b) musl-style posix_spawn(): clone(CLONE_VFORK|CLONE_VM|SIGCHLD,
+        //       child_stack=mmap_blob). The child runs on its own pre-mmap'd
+        //       stack, so the parent is free to keep running concurrently;
+        //       musl synchronizes via a CLOEXEC pipe instead.
+        //
+        // In both cases we must keep CLONE_VM so the child shares the parent's
+        // address space (the supplied child_stack pointer is only valid there
+        // anyway).
+        let is_vfork = flags.contains(CloneFlags::VFORK);
+        // Only block the parent for case (a). For case (b) the user-supplied
+        // child stack means we don't need vfork's stack-protection guarantee.
+        let needs_vfork_block = is_vfork && stack == 0;
+        if is_vfork {
+            flags.insert(CloneFlags::VM);
         }
 
         debug!(
@@ -286,10 +310,47 @@ impl CloneArgs {
                 return Err(err.into());
             }
         }
+
+        // CLONE_VFORK: install a PollSet that the child will wake when it
+        // releases its hold on the parent's address space (execve / _exit).
+        // Only do this for the bare-vfork case (stack=0); musl's posix_spawn
+        // uses CLONE_VFORK as a hint but synchronizes via a CLOEXEC pipe,
+        // and blocking the parent here would actually deadlock it (the parent
+        // never gets to read the pipe, so the child also can't proceed past
+        // execve in some configurations).
+        let vfork_evt: Option<Arc<PollSet>> = if needs_vfork_block {
+            let ev: Arc<PollSet> = Arc::default();
+            *thr.vfork_done.lock() = Some(ev.clone());
+            Some(ev)
+        } else {
+            None
+        };
+
         *new_task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
         let task = spawn_task(new_task);
         add_task_to_table(&task);
+
+        // Block the parent on the vfork PollSet until the child releases its
+        // hold on our address space (via execve(2) or _exit(2)). The child
+        // takes the PollSet out of its Thread::vfork_done slot and drops it
+        // after waking; we observe that as `strong_count(&ev) == 1` here.
+        // We use interruptible() so SIGCHLD etc. can still wake us.
+        // Block parent on the vfork PollSet until the child releases its hold
+        // on our address space (via execve(2) or _exit(2)). This is only set
+        // up for the bare-vfork case (stack=0), see needs_vfork_block above.
+        if let Some(ev) = vfork_evt {
+            let _ = block_on(interruptible(poll_fn(|cx| {
+                if Arc::strong_count(&ev) <= 1 {
+                    return Poll::Ready(Ok::<(), AxError>(()));
+                }
+                ev.register(cx.waker());
+                if Arc::strong_count(&ev) <= 1 {
+                    return Poll::Ready(Ok::<(), AxError>(()));
+                }
+                Poll::Pending
+            })));
+        }
 
         Ok(tid as _)
     }
