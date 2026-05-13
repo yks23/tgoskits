@@ -129,4 +129,22 @@ mod tests {
             AxError::InvalidInput
         );
     }
+
+    #[test]
+    fn validate_rseq_addr_rejects_wrong_len() {
+        assert_eq!(
+            validate_rseq_addr(1usize as *mut u8, super::RSEQ_LEN - 1).unwrap_err(),
+            AxError::InvalidInput
+        );
+    }
+
+    #[test]
+    fn validate_rseq_flags_accepts_register_and_unregister_only() {
+        assert!(!super::validate_rseq_flags(0).unwrap());
+        assert!(super::validate_rseq_flags(super::RSEQ_FLAG_UNREGISTER).unwrap());
+        assert_eq!(
+            super::validate_rseq_flags(2).unwrap_err(),
+            AxError::InvalidInput
+        );
+    }
 }

@@ -20,6 +20,13 @@ pub fn sys_sched_yield() -> AxResult<isize> {
     Ok(0)
 }
 
+pub fn sys_restart_syscall() -> AxResult<isize> {
+    debug!("sys_restart_syscall");
+    // Starry does not currently save enough interrupted-syscall state to replay
+    // nanosleep/ppoll safely. Report EINTR rather than falling through to ENOSYS.
+    Err(AxError::Interrupted)
+}
+
 fn sleep_impl(clock: impl Fn() -> TimeValue, dur: TimeValue) -> TimeValue {
     debug!("sleep_impl <= {dur:?}");
 

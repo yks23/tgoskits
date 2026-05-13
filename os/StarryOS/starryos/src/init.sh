@@ -23,6 +23,17 @@ if [ -x /opt/guest-onecrate-inner.sh ]; then
 	exec /bin/bash --noprofile --norc /opt/guest-onecrate-inner.sh
 fi
 
+# One-crate cargo evidence can bypass the generic /opt/run-tests.sh shell
+# wrapper. This keeps init from forking into an extra shell on rootfs images
+# where that path exits with a stack-protector abort before the real test runs.
+if [ -x /opt/guest-onecrate-inner.sh ]; then
+	if [ -r /opt/guest-onecrate-env.sh ]; then
+		. /opt/guest-onecrate-env.sh
+	fi
+	echo "===GUEST_ONECRATE_INIT_DIRECT==="
+	exec /bin/bash --noprofile --norc /opt/guest-onecrate-inner.sh
+fi
+
 # F-γ：pipe / dup2 / execve 诊断；仅当未注入 /opt/run-tests.sh 时才 exec，避免与 self-host 批量测试抢 init。
 if [ ! -x /opt/run-tests.sh ] && [ -x /opt/selfhost-tests/test_pipe_bisect_1 ]; then
 	exec /opt/selfhost-tests/test_pipe_bisect_1
