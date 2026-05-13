@@ -14,12 +14,11 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
 
-use crate::file::{flock, record_lock};
-
 use super::{
     AsThread, FutexKey, ProcessData, TimerState, futex_table_for, send_signal_thread_inner,
     send_signal_to_process, send_signal_to_thread,
 };
+use crate::file::{flock, record_lock};
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 
@@ -33,6 +32,7 @@ static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap:
 ///
 /// This function is intended to be used during memory leak analysis to remove
 /// possible noise caused by expired entries in the [`WeakMap`].
+#[cfg(feature = "memtrack")]
 pub fn cleanup_task_tables() {
     TASK_TABLE.write().cleanup();
     PROCESS_TABLE.write().cleanup();
@@ -118,9 +118,16 @@ pub fn get_process_group(pgid: Pid) -> AxResult<Arc<ProcessGroup>> {
         .ok_or(AxError::NoSuchProcess)
 }
 
-/// Finds the session with the given SID.
-pub fn get_session(sid: Pid) -> AxResult<Arc<Session>> {
-    SESSION_TABLE.read().get(&sid).ok_or(AxError::NoSuchProcess)
+/// Registers a process group in the global table.
+pub fn register_process_group(pg: &Arc<ProcessGroup>) {
+    let mut pg_table = PROCESS_GROUP_TABLE.write();
+    pg_table.insert(pg.pgid(), pg);
+}
+
+/// Registers a session in the global table.
+pub fn register_session(session: &Arc<Session>) {
+    let mut session_table = SESSION_TABLE.write();
+    session_table.insert(session.sid(), session);
 }
 
 /// Poll the timer
@@ -208,6 +215,11 @@ pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
         ax_task::yield_now();
     }
 
+    // Process the pending entry that was skipped in the loop
+    if !pending.is_null() {
+        handle_futex_death(pending, offset)?;
+    }
+
     Ok(())
 }
 
@@ -218,8 +230,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     info!("{} exit with code: {}", curr.id_name(), exit_code);
 
     // CLONE_VFORK: if our parent is blocked on us, release it now.
-    // Safe to call multiple times — release_vfork_parent() takes() the slot.
-    thr.release_vfork_parent();
+    thr.proc_data.notify_vfork_done();
 
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
     if clear_child_tid.vm_write(0).is_ok() {
@@ -245,6 +256,16 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         let pid = process.pid();
         flock::release_all_for_pid(pid);
         record_lock::release_posix_for_pid(pid);
+
+        // Close all file descriptors before marking the process as exited.
+        // This ensures pipe write ends and other resources are properly released,
+        // so parent processes blocking on pipe reads will receive EOF.
+        crate::file::close_all_fds();
+
+        // Snapshot children BEFORE process.exit() reparents them to init
+        // via mem::take. Otherwise process.children() returns an empty
+        // list and pdeathsig never reaches the real children.
+        let children_snapshot = process.children();
         process.exit();
         if let Some(parent) = process.parent() {
             if let Some(signo) = thr.proc_data.exit_signal {
@@ -254,11 +275,27 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
                 data.child_exit_event.wake();
             }
         }
+        // Send pdeathsig to child processes
+        for child in children_snapshot {
+            let child_pid = child.pid();
+            if let Ok(child_task) = get_task(child_pid)
+                && let Some(child_thr) = child_task.try_as_thread()
+            {
+                let sig = child_thr.pdeathsig();
+                if sig > 0
+                    && let Some(signo) = Signo::from_repr(sig as u8)
+                {
+                    let _ = send_signal_to_process(child_pid, Some(SignalInfo::new_kernel(signo)));
+                }
+            }
+        }
+
         thr.proc_data.exit_event.wake();
 
-        crate::syscall::SHM_MANAGER
-            .lock()
-            .clear_proc_shm(process.pid());
+        // Unblock a vfork parent waiting for this child to exit.
+        thr.proc_data.notify_vfork_done();
+
+        crate::syscall::clear_proc_shm(process.pid(), &thr.proc_data.aspace());
     }
     thr.exit_event.wake();
 

@@ -21,7 +21,10 @@ pub const IPPROTO_IPV6: u32 = 41;
 pub const IPV6_V6ONLY: u32 = 26;
 
 /// Read a `sockaddr_in6` from user space (thin wrapper around [`SocketAddrV6::read_from_user`]).
-pub fn from_sockaddr_in6(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<SocketAddrV6> {
+pub fn from_sockaddr_in6(
+    addr: UserConstPtr<sockaddr>,
+    addrlen: socklen_t,
+) -> AxResult<SocketAddrV6> {
     SocketAddrV6::read_from_user(addr, addrlen)
 }
 
@@ -36,7 +39,10 @@ pub fn to_sockaddr_in6(
 
 /// Map an IPv4 loopback / any / concrete address into IPv4 for the v4-only stack from an IPv6
 /// socket address (`::`, `::1`, `::ffff:x.x.x.x`, or a non-mappable IPv6 address).
-pub fn normalize_socket_addr_ex_for_ip_stack(addr: SocketAddrEx, is_bind: bool) -> AxResult<SocketAddrEx> {
+pub fn normalize_socket_addr_ex_for_ip_stack(
+    addr: SocketAddrEx,
+    is_bind: bool,
+) -> AxResult<SocketAddrEx> {
     match addr {
         SocketAddrEx::Ip(SocketAddr::V4(_)) => Ok(addr),
         SocketAddrEx::Ip(SocketAddr::V6(v6)) => {
@@ -55,7 +61,10 @@ pub fn normalize_socket_addr_ex_for_ip_stack(addr: SocketAddrEx, is_bind: bool) 
             } else {
                 return Err(AxError::from(LinuxError::ENETUNREACH));
             };
-            Ok(SocketAddrEx::Ip(SocketAddr::V4(SocketAddrV4::new(v4, v6.port()))))
+            Ok(SocketAddrEx::Ip(SocketAddr::V4(SocketAddrV4::new(
+                v4,
+                v6.port(),
+            ))))
         }
         SocketAddrEx::Unix(_) => Ok(addr),
         #[cfg(feature = "vsock")]
@@ -143,7 +152,7 @@ impl SocketAddrExt for SocketAddr {
 
 impl SocketAddrExt for SocketAddrV4 {
     fn read_from_user(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<Self> {
-        if addrlen != size_of::<sockaddr_in>() as socklen_t {
+        if addrlen < size_of::<sockaddr_in>() as socklen_t {
             return Err(AxError::InvalidInput);
         }
         let addr_in = addr.cast::<sockaddr_in>().get_as_ref()?;
@@ -176,7 +185,7 @@ impl SocketAddrExt for SocketAddrV4 {
 
 impl SocketAddrExt for SocketAddrV6 {
     fn read_from_user(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<Self> {
-        if addrlen != size_of::<sockaddr_in6>() as socklen_t {
+        if addrlen < size_of::<sockaddr_in6>() as socklen_t {
             return Err(AxError::InvalidInput);
         }
         let addr_in6 = addr.cast::<sockaddr_in6>().get_as_ref()?;

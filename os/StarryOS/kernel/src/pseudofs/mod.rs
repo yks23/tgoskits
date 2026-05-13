@@ -1,7 +1,7 @@
 //! Basic virtual filesystem support
 
-pub mod dev;
 pub mod bind_mount;
+pub mod dev;
 mod device;
 mod dir;
 mod file;

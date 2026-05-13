@@ -8,14 +8,14 @@ use ax_task::{
 };
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    __WALL, __WCLONE, __WNOTHREAD, siginfo, siginfo__bindgen_ty_1__bindgen_ty_1, CLD_DUMPED,
-    rusage, CLD_EXITED, CLD_KILLED, CLD_STOPPED, P_ALL, P_PID, P_PIDFD, P_PGID, SIGCHLD,
-    WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WUNTRACED,
+    __WALL, __WCLONE, __WNOTHREAD, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, P_ALL, P_PGID,
+    P_PID, P_PIDFD, SIGCHLD, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WUNTRACED, rusage, siginfo,
+    siginfo__bindgen_ty_1__bindgen_ty_1,
 };
 use starry_process::{Pid, Process};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::AsThread;
+use crate::task::{AsThread, get_task};
 
 bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -186,8 +186,7 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let proc = &proc_data.proc;
+    let proc = &curr.as_thread().proc_data.proc;
 
     let pid = if pid == -1 {
         WaitPid::Any
@@ -201,13 +200,23 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
 
     // FIXME: add back support for WALL & WCLONE, since ProcessData may drop before
     // Process now.
+    let proc_data = curr.as_thread().proc_data.clone();
+
     block_on(interruptible(poll_fn(|cx| {
         match wait_children(proc, pid, options, exit_code, core::ptr::null_mut()) {
             Ok(WaitPoll::Found { pid, .. }) => Poll::Ready(Ok(pid as isize)),
             Ok(WaitPoll::NoHang) => Poll::Ready(Ok(0)),
             Ok(WaitPoll::Pending) => {
                 proc_data.child_exit_event.register(cx.waker());
-                Poll::Pending
+                // A child may exit between the check above and waker
+                // registration. Recheck after registering so that wakeup is
+                // not lost in that race window.
+                match wait_children(proc, pid, options, exit_code, core::ptr::null_mut()) {
+                    Ok(WaitPoll::Found { pid, .. }) => Poll::Ready(Ok(pid as isize)),
+                    Ok(WaitPoll::NoHang) => Poll::Ready(Ok(0)),
+                    Ok(WaitPoll::Pending) => Poll::Pending,
+                    Err(e) => Poll::Ready(Err(e)),
+                }
             }
             Err(e) => Poll::Ready(Err(e)),
         }

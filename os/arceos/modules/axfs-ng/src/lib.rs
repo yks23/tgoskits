@@ -31,8 +31,8 @@ use spin::Mutex as SpinMutex;
 mod fs;
 
 mod highlevel;
-pub use highlevel::*;
 pub use fs::new_ext4_shared;
+pub use highlevel::*;
 
 /// Block devices discovered during boot but not used as root, keyed by virtio-blk probe order.
 static SPARE_BLOCK_DEVS: SpinMutex<Option<BTreeMap<usize, Arc<AxSyncMutex<AxBlockDevice>>>>> =

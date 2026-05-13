@@ -3,7 +3,7 @@
 use core::ops::{Index, IndexMut};
 
 use linux_raw_sys::general::{
-    RLIM64_INFINITY, RLIM_NLIMITS, RLIMIT_AS, RLIMIT_DATA, RLIMIT_NOFILE, RLIMIT_NPROC,
+    RLIM_NLIMITS, RLIM64_INFINITY, RLIMIT_AS, RLIMIT_DATA, RLIMIT_NOFILE, RLIMIT_NPROC,
     RLIMIT_STACK,
 };
 
@@ -28,10 +28,7 @@ pub struct Rlimit {
 
 impl Default for Rlimit {
     fn default() -> Self {
-        Self {
-            current: 0,
-            max: 0,
-        }
+        Self { current: 0, max: 0 }
     }
 }
 
@@ -61,12 +58,13 @@ pub struct Rlimits([Rlimit; RLIM_NLIMITS as usize]);
 impl Default for Rlimits {
     fn default() -> Self {
         let mut result = Self(core::array::from_fn(|_| Rlimit::default()));
+        // Match the Linux default (8 MiB) so applications like PostgreSQL
+        // that compute safe recursion/stack-depth limits from getrlimit
+        // get a consistent answer. USER_STACK_SIZE is kept in sync so the
+        // advertised limit matches the mapped stack VMA.
         let stack = crate::config::USER_STACK_SIZE as u64;
         result[RLIMIT_STACK] = Rlimit::new(stack, stack);
-        result[RLIMIT_NOFILE] = Rlimit::new(
-            AX_FILE_LIMIT_SOFT,
-            AX_FILE_LIMIT as u64,
-        );
+        result[RLIMIT_NOFILE] = Rlimit::new(AX_FILE_LIMIT_SOFT, AX_FILE_LIMIT as u64);
         let as_bytes = crate::config::USER_SPACE_SIZE as u64;
         result[RLIMIT_AS] = Rlimit::new(as_bytes, as_bytes);
         let data_bytes = crate::config::USER_HEAP_SIZE_MAX as u64;

@@ -2,15 +2,13 @@ use ax_errno::{AxError, AxResult};
 use ax_hal::time::TimeValue;
 use ax_task::current;
 use linux_raw_sys::general::{
-    __kernel_old_timeval, RLIM64_INFINITY, RLIM_NLIMITS, RLIMIT_NOFILE, rlimit64, rusage,
+    __kernel_old_timeval, RLIM_NLIMITS, RLIM64_INFINITY, RLIMIT_NOFILE, rlimit64, rusage,
 };
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    task::{
-        AsThread, Thread, AX_FILE_LIMIT, get_process_data, get_task, rlim_is_infinite,
-    },
+    task::{AX_FILE_LIMIT, AsThread, Thread, get_process_data, get_task, rlim_is_infinite},
     time::TimeValueLike,
 };
 

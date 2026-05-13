@@ -8,6 +8,7 @@ fi
 export HOME=/root
 export USER=root
 export HOSTNAME=starry
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # F-γ：pipe / dup2 / execve 诊断；仅当未注入 /opt/run-tests.sh 时才 exec，避免与 self-host 批量测试抢 init。
 if [ ! -x /opt/run-tests.sh ] && [ -x /opt/selfhost-tests/test_pipe_bisect_1 ]; then
@@ -24,6 +25,7 @@ echo
 # Do your initialization here!
 
 cd "$HOME" || cd /
+cat > /tmp/starry-shrc <<'EOF'
 export PS1='${USER}@${HOSTNAME}:${PWD} # '
 
 # Self-host test hook: 如果 rootfs 注入了 /opt/run-tests.sh，自动跑测试
@@ -33,5 +35,6 @@ if [ -x /opt/run-tests.sh ]; then
     echo "===SELFHOST-DONE==="
     exit 0
 fi
-
-exec /bin/sh -i
+EOF
+export ENV=/tmp/starry-shrc
+exec /bin/sh -l -i

@@ -1,15 +1,16 @@
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use core::ffi::{c_char, c_void};
-
-use alloc::{collections::BTreeMap, collections::BTreeSet, sync::Arc};
 
 use ax_driver::{PartitionRegion, prelude::BlockDriverOps};
 use ax_errno::{AxError, AxResult, LinuxError};
 use ax_fs::{FS_CONTEXT, new_ext4_shared, spare_block_disk, virtio_disk_index_for_path};
 use ax_task::current;
 use axfs_ng_vfs::{Mountpoint, NodeType};
-use spin::Mutex;
-
 use downcast_rs::Downcast;
+use spin::Mutex;
 
 use crate::{
     file::{Directory, FD_TABLE, File},
@@ -68,7 +69,9 @@ pub fn sys_mount(
     let source = vm_load_string(source)?;
     let target = vm_load_string(target)?;
     let fs_type = vm_load_string(fs_type)?;
-    debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}, flags: {flags}");
+    debug!(
+        "sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}, flags: {flags}"
+    );
 
     if flags & MS_BIND != 0 {
         return do_bind_mount(&source, &target);

@@ -214,7 +214,11 @@ pub fn release_all_for_pid(pid: u32) {
 }
 
 /// Apply `flock(2)` for a regular file.
-pub fn flock_inode(st: (u64, u64), file: &Arc<dyn super::FileLike>, operation: i32) -> AxResult<()> {
+pub fn flock_inode(
+    st: (u64, u64),
+    file: &Arc<dyn super::FileLike>,
+    operation: i32,
+) -> AxResult<()> {
     let op = operation as u32;
     const LOCK_SH: u32 = linux_raw_sys::general::LOCK_SH;
     const LOCK_EX: u32 = linux_raw_sys::general::LOCK_EX;

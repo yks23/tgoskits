@@ -6,7 +6,7 @@ use ax_fs::FS_CONTEXT;
 use ax_hal::uspace::UserContext;
 use ax_kspin::SpinNoIrq;
 use ax_task::{
-    AxTaskExt, current,
+    AxTaskExt, WaitQueue, current,
     future::{block_on, interruptible},
     spawn_task,
 };
@@ -215,7 +215,7 @@ impl CloneArgs {
         let new_proc_data = if flags.contains(CloneFlags::THREAD) {
             new_task
                 .ctx_mut()
-                .set_page_table_root(old_proc_data.aspace.lock().page_table_root());
+                .set_page_table_root(old_proc_data.aspace().lock().page_table_root());
             old_proc_data.clone()
         } else {
             let nproc = old_proc_data.rlim.read()[RLIMIT_NPROC].current;
@@ -231,9 +231,10 @@ impl CloneArgs {
             .fork(tid);
 
             let aspace = if flags.contains(CloneFlags::VM) {
-                old_proc_data.aspace.clone()
+                old_proc_data.aspace()
             } else {
-                let mut aspace = old_proc_data.aspace.lock();
+                let aspace_arc = old_proc_data.aspace();
+                let mut aspace = aspace_arc.lock();
                 let aspace = aspace.try_clone()?;
                 copy_from_kernel(&mut aspace.lock())?;
                 aspace
@@ -294,7 +295,8 @@ impl CloneArgs {
 
         new_proc_data.proc.add_thread(tid);
 
-        let thr = Thread::new(tid, new_proc_data.clone());
+        let parent_cred = Some(curr.as_thread().cred());
+        let thr = Thread::new(tid, new_proc_data.clone(), parent_cred);
         if flags.contains(CloneFlags::CHILD_CLEARTID) {
             thr.set_clear_child_tid(child_tid);
         }
@@ -328,17 +330,18 @@ impl CloneArgs {
 
         *new_task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
+        // CLONE_VFORK: wire a shared WaitQueue to the child so it can wake us.
+        if flags.contains(CloneFlags::VFORK) {
+            let wq = Arc::new(WaitQueue::new());
+            new_proc_data.set_vfork_done(wq);
+        }
+
         let task = spawn_task(new_task);
         add_task_to_table(&task);
 
         // Block the parent on the vfork PollSet until the child releases its
-        // hold on our address space (via execve(2) or _exit(2)). The child
-        // takes the PollSet out of its Thread::vfork_done slot and drops it
-        // after waking; we observe that as `strong_count(&ev) == 1` here.
-        // We use interruptible() so SIGCHLD etc. can still wake us.
-        // Block parent on the vfork PollSet until the child releases its hold
-        // on our address space (via execve(2) or _exit(2)). This is only set
-        // up for the bare-vfork case (stack=0), see needs_vfork_block above.
+        // hold on our address space (via execve(2) or _exit(2)). This is only
+        // set up for the bare-vfork case (stack=0), see needs_vfork_block above.
         if let Some(ev) = vfork_evt {
             let _ = block_on(interruptible(poll_fn(|cx| {
                 if Arc::strong_count(&ev) <= 1 {
@@ -350,6 +353,9 @@ impl CloneArgs {
                 }
                 Poll::Pending
             })));
+        } else if flags.contains(CloneFlags::VFORK) {
+            // posix_spawn style: use WaitQueue-based blocking.
+            new_proc_data.wait_vfork_done();
         }
 
         Ok(tid as _)
@@ -394,4 +400,10 @@ pub fn sys_clone(
 #[cfg(target_arch = "x86_64")]
 pub fn sys_fork(uctx: &UserContext) -> AxResult<isize> {
     sys_clone(uctx, SIGCHLD, 0, 0, 0, 0)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn sys_vfork(uctx: &UserContext) -> AxResult<isize> {
+    let flags = (CloneFlags::VFORK | CloneFlags::VM).bits() as u32 | SIGCHLD;
+    sys_clone(uctx, flags, 0, 0, 0, 0)
 }

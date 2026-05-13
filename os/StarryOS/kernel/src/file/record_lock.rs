@@ -61,12 +61,7 @@ fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
-fn conflicts_range(
-    probe_kind: RLKind,
-    probe_owner: RLOwner,
-    range: (u64, u64),
-    seg: &Seg,
-) -> bool {
+fn conflicts_range(probe_kind: RLKind, probe_owner: RLOwner, range: (u64, u64), seg: &Seg) -> bool {
     if probe_owner == seg.owner || !overlaps(range, (seg.start, seg.end)) {
         return false;
     }

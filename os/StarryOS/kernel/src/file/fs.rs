@@ -99,15 +99,17 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
 /// File wrapper for `ax_fs::fops::File`.
 pub struct File {
     inner: ax_fs::File,
+    open_flags: u32,
     nonblock: AtomicBool,
     /// `(F_SETOWN/F_GETOWN value, F_SETSIG/F_GETSIG value)` for async I/O metadata.
     fasync: Mutex<(i32, i32)>,
 }
 
 impl File {
-    pub fn new(inner: ax_fs::File) -> Self {
+    pub fn new(inner: ax_fs::File, open_flags: u32) -> Self {
         Self {
             inner,
+            open_flags,
             nonblock: AtomicBool::new(false),
             fasync: Mutex::new((0, 0)),
         }
@@ -183,6 +185,10 @@ impl FileLike for File {
         self.nonblock.load(Ordering::Acquire)
     }
 
+    fn open_flags(&self) -> u32 {
+        self.open_flags
+    }
+
     fn path(&self) -> Cow<'_, str> {
         path_for(self.inner.location())
     }
@@ -232,10 +238,13 @@ impl Directory {
 
 impl FileLike for Directory {
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
-        Err(AxError::BadFileDescriptor)
+        Err(AxError::IsADirectory)
     }
 
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
+        // Directories cannot be opened for writing, so any write attempt
+        // means the fd is not open for writing → EBADF.
+        // Linux VFS checks FMODE_WRITE before reaching the filesystem layer.
         Err(AxError::BadFileDescriptor)
     }
 
