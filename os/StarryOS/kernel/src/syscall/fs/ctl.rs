@@ -12,7 +12,7 @@ use ax_task::current;
 use axfs_ng_vfs::{DeviceId, MetadataUpdate, NodePermission, NodeType, path::Path};
 use linux_raw_sys::{
     general::*,
-    ioctl::{FIONBIO, TIOCGWINSZ},
+    ioctl::{FIONBIO, TCGETS, TCGETS2, TIOCGWINSZ},
 };
 use starry_vm::{VmPtr, vm_write_slice};
 
@@ -20,6 +20,7 @@ use crate::{
     file::{Directory, FileLike, get_file_like, resolve_at, with_fs},
     mm::vm_load_string,
     pseudofs::Device,
+    syscall::stats,
     task::AsThread,
     time::TimeValueLike,
 };
@@ -40,7 +41,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
             if *err == AxError::NotATty {
                 // glibc likes to call TIOCGWINSZ on non-terminal files, just
                 // ignore it
-                if cmd == TIOCGWINSZ {
+                if matches!(cmd, TCGETS | TCGETS2 | TIOCGWINSZ) {
                     return;
                 }
                 warn!("Unsupported ioctl command: {cmd} for fd: {fd}");
@@ -201,7 +202,12 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
     let mut buffer = DirBuffer::new(len);
 
-    let dir = Directory::from_fd(fd)?;
+    let dir = Directory::from_fd(fd).inspect_err(|err| {
+        stats::record_deep_event(
+            "path",
+            format_args!("getdents64_fd_err fd={} len={} err={:?}", fd, len, err),
+        );
+    })?;
     let mut dir_offset = dir.offset.lock();
 
     let mut has_remaining = false;
@@ -214,6 +220,15 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
             }
             *dir_offset = offset;
             true
+        })
+        .inspect_err(|err| {
+            stats::record_deep_event(
+                "path",
+                format_args!(
+                    "getdents64_read_dir_err fd={} offset={} len={} err={:?}",
+                    fd, *dir_offset, len, err
+                ),
+            );
         })?;
 
     if has_remaining && buffer.offset == 0 {
@@ -360,8 +375,24 @@ pub fn sys_readlinkat(
     debug!("sys_readlinkat <= dirfd: {dirfd}, path: {path:?}");
 
     with_fs(dirfd, |fs| {
-        let entry = fs.resolve_no_follow(path)?;
-        let link = entry.read_link()?;
+        let entry = fs.resolve_no_follow(path.clone()).inspect_err(|err| {
+            stats::record_deep_event(
+                "path",
+                format_args!(
+                    "readlinkat_resolve_err dirfd={} path={:?} err={:?}",
+                    dirfd, path, err
+                ),
+            );
+        })?;
+        let link = entry.read_link().inspect_err(|err| {
+            stats::record_deep_event(
+                "path",
+                format_args!(
+                    "readlinkat_link_err dirfd={} path={:?} err={:?}",
+                    dirfd, path, err
+                ),
+            );
+        })?;
         let read = size.min(link.len());
         vm_write_slice(buf, &link.as_bytes()[..read])?;
         Ok(read as isize)
@@ -571,7 +602,6 @@ pub fn sys_rename(old_path: *const c_char, new_path: *const c_char) -> AxResult<
     sys_renameat(AT_FDCWD, old_path, AT_FDCWD, new_path)
 }
 
-#[cfg(not(target_arch = "riscv64"))]
 pub fn sys_renameat(
     old_dirfd: i32,
     old_path: *const c_char,

@@ -10,6 +10,7 @@ use linux_raw_sys::general::{
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
+    syscall::stats,
     task::{AsThread, FutexKey, futex_table_for, get_task},
     time::TimeValueLike,
 };
@@ -67,6 +68,16 @@ pub fn sys_futex(
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             // Fast path
             if uaddr.vm_read()? != value {
+                stats::record_deep_event(
+                    "futex",
+                    format_args!(
+                        "wait_mismatch addr={:#x} op={} expected={} bitset={:#x}",
+                        uaddr.addr(),
+                        futex_op,
+                        value,
+                        value3
+                    ),
+                );
                 return Err(AxError::WouldBlock);
             }
 
@@ -80,16 +91,67 @@ pub fn sys_futex(
                 u32::MAX
             };
 
-            if !futex
+            stats::record_deep_event(
+                "futex",
+                format_args!(
+                    "wait_enter addr={:#x} op={} expected={} bitset={:#x} timeout={:?}",
+                    uaddr.addr(),
+                    futex_op,
+                    value,
+                    bitset,
+                    timeout
+                ),
+            );
+
+            match futex
                 .wq
-                .wait_if(bitset, timeout, || uaddr.vm_read() == Ok(value))?
+                .wait_if(bitset, timeout, || uaddr.vm_read() == Ok(value))
             {
-                return Err(AxError::WouldBlock);
+                Ok(true) => {}
+                Ok(false) => {
+                    stats::record_deep_event(
+                        "futex",
+                        format_args!(
+                            "wait_exit addr={:#x} op={} result=wouldblock",
+                            uaddr.addr(),
+                            futex_op
+                        ),
+                    );
+                    return Err(AxError::WouldBlock);
+                }
+                Err(err) => {
+                    stats::record_deep_event(
+                        "futex",
+                        format_args!(
+                            "wait_exit addr={:#x} op={} result={:?}",
+                            uaddr.addr(),
+                            futex_op,
+                            err
+                        ),
+                    );
+                    return Err(err);
+                }
             }
 
             if futex.owner_dead.swap(false, Ordering::SeqCst) {
+                stats::record_deep_event(
+                    "futex",
+                    format_args!(
+                        "wait_exit addr={:#x} op={} result=ownerdead",
+                        uaddr.addr(),
+                        futex_op
+                    ),
+                );
                 Err(AxError::from(LinuxError::EOWNERDEAD))
             } else {
+                stats::record_deep_event(
+                    "futex",
+                    format_args!(
+                        "wait_exit addr={:#x} op={} result=ok",
+                        uaddr.addr(),
+                        futex_op
+                    ),
+                );
                 Ok(0)
             }
         }
@@ -104,6 +166,17 @@ pub fn sys_futex(
                 };
                 count = futex.wq.wake(value as _, bitset);
             }
+            stats::record_deep_event(
+                "futex",
+                format_args!(
+                    "wake addr={:#x} op={} requested={} bitset={:#x} woken={}",
+                    uaddr.addr(),
+                    futex_op,
+                    value,
+                    value3,
+                    count
+                ),
+            );
             ax_task::yield_now();
             Ok(count as _)
         }
@@ -126,6 +199,18 @@ pub fn sys_futex(
                     count += futex.wq.requeue(value2 as _, &futex2.wq) as usize;
                 }
             }
+            stats::record_deep_event(
+                "futex",
+                format_args!(
+                    "requeue addr={:#x} addr2={:#x} op={} wake={} requeue={} affected={}",
+                    uaddr.addr(),
+                    uaddr2.addr(),
+                    futex_op,
+                    value,
+                    value2,
+                    count
+                ),
+            );
             Ok(count as _)
         }
         _ => Err(AxError::Unsupported),

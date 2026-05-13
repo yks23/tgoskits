@@ -7,13 +7,12 @@ use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use crate::{
     mm::vm_load_string,
-    task::{AsThread, Cred, get_process_data, get_task},
+    task::{AsThread, get_process_data},
 };
 
 const CAPABILITY_VERSION_3: u32 = 0x20080522;
 
-/// Validate the cap header and return the target pid (0 means self).
-fn validate_cap_header(header_ptr: *mut __user_cap_header_struct) -> AxResult<u32> {
+fn validate_cap_header(header_ptr: *mut __user_cap_header_struct) -> AxResult<()> {
     // FIXME: AnyBitPattern
     let mut header = unsafe { header_ptr.vm_read_uninit()?.assume_init() };
     if header.version != CAPABILITY_VERSION_3 {
@@ -21,45 +20,21 @@ fn validate_cap_header(header_ptr: *mut __user_cap_header_struct) -> AxResult<u3
         header_ptr.vm_write(header)?;
         return Err(AxError::InvalidInput);
     }
-    let pid = header.pid as u32;
-    let _ = get_process_data(pid)?;
-    Ok(pid)
-}
-
-/// Read the credential set for the thread identified by TID (0 = self).
-///
-/// capget(2) operates on the thread identified by `header.pid`; on Linux
-/// threads in the same thread group share the same `struct cred` by default,
-/// so reading any thread's cred gives the same answer.
-fn cred_for_pid(pid: u32) -> AxResult<alloc::sync::Arc<Cred>> {
-    if pid == 0 {
-        return Ok(current().as_thread().cred());
-    }
-    let task = get_task(pid).map_err(|_| AxError::NoSuchProcess)?;
-    task.try_as_thread()
-        .map(|t| t.cred())
-        .ok_or(AxError::NoSuchProcess)
+    let _ = get_process_data(header.pid as u32)?;
+    Ok(())
 }
 
 pub fn sys_capget(
     header: *mut __user_cap_header_struct,
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
-    let pid = validate_cap_header(header)?;
+    validate_cap_header(header)?;
 
-    let cred = cred_for_pid(pid)?;
-    let caps = if cred.euid == 0 { u32::MAX } else { 0 };
-    let data_struct = __user_cap_data_struct {
-        effective: caps,
-        permitted: caps,
-        inheritable: caps,
-    };
-    // Capability version 3 uses an array of TWO __user_cap_data_struct
-    // entries (low 32 bits and high 32 bits). Write both.
-    unsafe {
-        data.vm_write(data_struct)?;
-        data.add(1).vm_write(data_struct)?;
-    }
+    data.vm_write(__user_cap_data_struct {
+        effective: u32::MAX,
+        permitted: u32::MAX,
+        inheritable: u32::MAX,
+    })?;
     Ok(0)
 }
 
@@ -67,19 +42,50 @@ pub fn sys_capset(
     header: *mut __user_cap_header_struct,
     _data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
-    let _ = validate_cap_header(header)?;
+    validate_cap_header(header)?;
 
-    let cred = current().as_thread().cred();
-    if cred.euid != 0 {
-        return Err(AxError::OperationNotPermitted);
-    }
-    // For now, accept and ignore the values (no real capability tracking).
     Ok(0)
 }
 
 pub fn sys_umask(mask: u32) -> AxResult<isize> {
     let curr = current();
     let old = curr.as_thread().proc_data.replace_umask(mask);
+    Ok(old as isize)
+}
+
+pub fn sys_setreuid(ruid: u32, euid: u32) -> AxResult<isize> {
+    let task = current();
+    let pd = task.as_thread().proc_data.as_ref();
+    let suid = pd.res_uids().2;
+    pd.set_res_uids(ruid, euid, suid);
+    Ok(0)
+}
+
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> AxResult<isize> {
+    current()
+        .as_thread()
+        .proc_data
+        .set_res_uids(ruid, euid, suid);
+    Ok(0)
+}
+
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
+    current()
+        .as_thread()
+        .proc_data
+        .set_res_gids(rgid, egid, sgid);
+    Ok(0)
+}
+
+/// `personality(2)` — minimal ABI: `0xFFFFFFFF` queries, otherwise set and return previous.
+pub fn sys_personality(persona: u32) -> AxResult<isize> {
+    const QUERY: u32 = !0;
+    let task = current();
+    let pd = task.as_thread().proc_data.as_ref();
+    if persona == QUERY {
+        return Ok(pd.personality() as isize);
+    }
+    let old = pd.set_personality(persona);
     Ok(old as isize)
 }
 
@@ -125,18 +131,35 @@ pub fn sys_prctl(
             buf[..len].copy_from_slice(&name.as_bytes()[..len]);
             vm_write_slice(arg2 as _, &buf)?;
         }
-        PR_SET_PDEATHSIG => {
-            let sig = arg2 as u32;
-            if sig > 64 {
+        PR_SET_SECCOMP => {
+            if arg2 != 0 {
                 return Err(AxError::InvalidInput);
             }
-            current().as_thread().set_pdeathsig(sig);
         }
+        PR_GET_SECCOMP => return Ok(0),
+        PR_SET_DUMPABLE => {
+            if arg2 > 1 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        PR_GET_DUMPABLE => return Ok(1),
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        PR_GET_NO_NEW_PRIVS => return Ok(0),
+        PR_SET_TIMERSLACK => {}
+        PR_GET_TIMERSLACK => return Ok(50_000),
+        PR_SET_PDEATHSIG => {}
         PR_GET_PDEATHSIG => {
-            let sig = current().as_thread().pdeathsig() as i32;
-            (arg2 as *mut i32).vm_write(sig)?;
+            (arg2 as *mut i32).vm_write(0)?;
         }
-        PR_SET_SECCOMP => {}
+        PR_SET_VMA => {
+            if arg2 != PR_SET_VMA_ANON_NAME as usize {
+                return Err(AxError::InvalidInput);
+            }
+        }
         PR_MCE_KILL => {}
         PR_SET_MM => {
             // not implemented; but avoid annoying warnings

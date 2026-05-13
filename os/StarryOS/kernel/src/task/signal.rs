@@ -2,7 +2,7 @@ use ax_errno::{AxError, AxResult};
 use ax_hal::uspace::UserContext;
 use ax_task::{TaskInner, current};
 use starry_process::Pid;
-use starry_signal::{SignalInfo, SignalOSAction, SignalSet};
+use starry_signal::{SignalInfo, SignalOSAction, SignalSet, Signo};
 
 use super::{
     AsThread, SYSCALL_INSN_LEN, Thread, do_exit, get_process_data, get_process_group, get_task,
@@ -119,6 +119,7 @@ pub fn send_signal_to_process(pid: Pid, sig: Option<SignalInfo>) -> AxResult<()>
         info!("Send signal {signo:?} to process {pid}");
         if let Some(tid) = proc_data.signal.send_signal(sig)
             && let Ok(task) = get_task(tid)
+            && signo != Signo::SIGCHLD
         {
             task.interrupt();
         }

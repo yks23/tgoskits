@@ -1,9 +1,8 @@
 //! POSIX / OFD byte-range record locks (`fcntl`).
 
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use ax_errno::{AxError, AxResult};
-use ax_kspin::SpinNoIrq;
 use ax_sync::Mutex;
 use hashbrown::HashMap;
 use linux_raw_sys::general::{F_RDLCK, F_UNLCK, F_WRLCK, flock64};
@@ -47,7 +46,10 @@ impl RLInode {
 }
 
 lazy_static::lazy_static! {
-    static ref RECORD_INODES: SpinNoIrq<HashMap<InodeKey, Arc<Mutex<RLInode>>>> = SpinNoIrq::new(HashMap::new());
+    /// Use blocking `ax_sync::Mutex` for this map (not `SpinNoIrq`) so paths
+    /// like `setlk` → `wait_if` → `Mutex::lock` never sleep inside an IRQ-off
+    /// spin critical section (which would panic in `ax_task::WaitQueue::wait_until`).
+    static ref RECORD_INODES: Mutex<HashMap<InodeKey, Arc<Mutex<RLInode>>>> = Mutex::new(HashMap::new());
 }
 
 fn bucket(key: InodeKey) -> Arc<Mutex<RLInode>> {

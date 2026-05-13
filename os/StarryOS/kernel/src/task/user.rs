@@ -5,10 +5,25 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
-    AsThread, SyscallRestartInfo, TimerState, check_signals, do_exit, raise_signal_fatal,
+    AsThread, SyscallRestartInfo, Thread, TimerState, check_signals, do_exit, raise_signal_fatal,
     set_timer_state, unblock_next_signal,
 };
 use crate::syscall::handle_syscall;
+
+fn record_user_regs(thread: &Thread, uctx: &UserContext) {
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    let ra = uctx.regs.ra;
+    #[cfg(target_arch = "aarch64")]
+    let ra = uctx.x[30] as usize;
+    #[cfg(not(any(
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    )))]
+    let ra = 0;
+
+    thread.record_user_regs(uctx.ip(), uctx.sp(), ra, uctx.tls());
+}
 
 /// Create a new user task.
 pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) -> TaskInner {
@@ -23,11 +38,13 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
             info!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
 
             let thr = curr.as_thread();
+            record_user_regs(thr, &uctx);
             while !thr.pending_exit() {
                 if thr.execve_kill.load(core::sync::atomic::Ordering::Acquire) {
                     do_exit(Signo::SIGKILL as i32, false);
                 }
                 let reason = uctx.run();
+                record_user_regs(thr, &uctx);
 
                 set_timer_state(&curr, TimerState::Kernel);
 

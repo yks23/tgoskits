@@ -1,7 +1,7 @@
 use alloc::{borrow::Cow, format, sync::Arc};
 use core::{
     mem,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Context,
 };
 
@@ -13,10 +13,7 @@ use ax_task::{
     future::{block_on, poll_io},
 };
 use axpoll::{IoEvents, PollSet, Pollable};
-use linux_raw_sys::{
-    general::{O_RDONLY, O_WRONLY, S_IFIFO},
-    ioctl::FIONREAD,
-};
+use linux_raw_sys::{general::S_IFIFO, ioctl::FIONREAD};
 use ringbuf::{
     HeapRb,
     traits::{Consumer, Observer, Producer},
@@ -27,6 +24,7 @@ use starry_vm::VmMutPtr;
 use super::{FileLike, Kstat};
 use crate::{
     file::{IoDst, IoSrc},
+    syscall::stats,
     task::{AsThread, send_signal_to_process},
 };
 
@@ -37,6 +35,8 @@ struct Shared {
     poll_rx: PollSet,
     poll_tx: PollSet,
     poll_close: PollSet,
+    readers: AtomicUsize,
+    writers: AtomicUsize,
 }
 
 pub struct Pipe {
@@ -46,11 +46,44 @@ pub struct Pipe {
 }
 impl Drop for Pipe {
     fn drop(&mut self) {
-        // Closing the write end must unblock readers waiting on an empty buffer.
-        if self.is_write() {
-            self.shared.poll_rx.wake();
+        if self.is_read() {
+            let readers = self.shared.readers.fetch_sub(1, Ordering::AcqRel);
+            let woken = self.shared.poll_tx.wake();
+            stats::record_deep_event(
+                "pipe",
+                format_args!(
+                    "close_read pipe={:#x} readers_before={} writers={} tx_woken={}",
+                    Arc::as_ptr(&self.shared) as usize,
+                    readers,
+                    self.shared.writers.load(Ordering::Acquire),
+                    woken
+                ),
+            );
+        } else {
+            let writers = self.shared.writers.fetch_sub(1, Ordering::AcqRel);
+            let woken = self.shared.poll_rx.wake();
+            stats::record_deep_event(
+                "pipe",
+                format_args!(
+                    "close_write pipe={:#x} readers={} writers_before={} rx_woken={}",
+                    Arc::as_ptr(&self.shared) as usize,
+                    self.shared.readers.load(Ordering::Acquire),
+                    writers,
+                    woken
+                ),
+            );
         }
-        self.shared.poll_close.wake();
+        let close_woken = self.shared.poll_close.wake();
+        stats::record_deep_event(
+            "pipe",
+            format_args!(
+                "close_notify pipe={:#x} readers={} writers={} close_woken={}",
+                Arc::as_ptr(&self.shared) as usize,
+                self.shared.readers.load(Ordering::Acquire),
+                self.shared.writers.load(Ordering::Acquire),
+                close_woken
+            ),
+        );
     }
 }
 
@@ -61,6 +94,8 @@ impl Pipe {
             poll_rx: PollSet::new(),
             poll_tx: PollSet::new(),
             poll_close: PollSet::new(),
+            readers: AtomicUsize::new(1),
+            writers: AtomicUsize::new(1),
         });
         let read_end = Pipe {
             read_side: true,
@@ -84,7 +119,11 @@ impl Pipe {
     }
 
     pub fn closed(&self) -> bool {
-        Arc::strong_count(&self.shared) == 1
+        if self.is_read() {
+            self.shared.writers.load(Ordering::Acquire) == 0
+        } else {
+            self.shared.readers.load(Ordering::Acquire) == 0
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -139,11 +178,39 @@ impl FileLike for Pipe {
                 count
             };
             if read > 0 {
-                self.shared.poll_tx.wake();
+                let woken = self.shared.poll_tx.wake();
+                stats::record_deep_event(
+                    "pipe",
+                    format_args!(
+                        "read_data pipe={:#x} bytes={} readers={} writers={} tx_woken={}",
+                        Arc::as_ptr(&self.shared) as usize,
+                        read,
+                        self.shared.readers.load(Ordering::Acquire),
+                        self.shared.writers.load(Ordering::Acquire),
+                        woken
+                    ),
+                );
                 Ok(read)
             } else if self.closed() {
+                stats::record_deep_event(
+                    "pipe",
+                    format_args!(
+                        "read_eof pipe={:#x} readers={} writers=0",
+                        Arc::as_ptr(&self.shared) as usize,
+                        self.shared.readers.load(Ordering::Acquire)
+                    ),
+                );
                 Ok(0)
             } else {
+                stats::record_deep_event(
+                    "pipe",
+                    format_args!(
+                        "read_wouldblock pipe={:#x} readers={} writers={} len=0",
+                        Arc::as_ptr(&self.shared) as usize,
+                        self.shared.readers.load(Ordering::Acquire),
+                        self.shared.writers.load(Ordering::Acquire)
+                    ),
+                );
                 Err(AxError::WouldBlock)
             }
         }))
@@ -162,6 +229,15 @@ impl FileLike for Pipe {
 
         block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
             if self.closed() {
+                stats::record_deep_event(
+                    "pipe",
+                    format_args!(
+                        "write_broken pipe={:#x} readers=0 writers={} remaining={}",
+                        Arc::as_ptr(&self.shared) as usize,
+                        self.shared.writers.load(Ordering::Acquire),
+                        src.remaining()
+                    ),
+                );
                 raise_pipe();
                 return Err(AxError::BrokenPipe);
             }
@@ -177,12 +253,35 @@ impl FileLike for Pipe {
                 count
             };
             if written > 0 {
-                self.shared.poll_rx.wake();
+                let woken = self.shared.poll_rx.wake();
                 total_written += written;
+                stats::record_deep_event(
+                    "pipe",
+                    format_args!(
+                        "write_data pipe={:#x} bytes={} total={} readers={} writers={} rx_woken={}",
+                        Arc::as_ptr(&self.shared) as usize,
+                        written,
+                        total_written,
+                        self.shared.readers.load(Ordering::Acquire),
+                        self.shared.writers.load(Ordering::Acquire),
+                        woken
+                    ),
+                );
                 if total_written == size || self.nonblocking() {
                     return Ok(total_written);
                 }
             }
+            stats::record_deep_event(
+                "pipe",
+                format_args!(
+                    "write_wouldblock pipe={:#x} total={} requested={} readers={} writers={}",
+                    Arc::as_ptr(&self.shared) as usize,
+                    total_written,
+                    size,
+                    self.shared.readers.load(Ordering::Acquire),
+                    self.shared.writers.load(Ordering::Acquire)
+                ),
+            );
             Err(AxError::WouldBlock)
         }))
     }
@@ -196,10 +295,6 @@ impl FileLike for Pipe {
 
     fn path(&self) -> Cow<'_, str> {
         format!("pipe:[{}]", self as *const _ as usize).into()
-    }
-
-    fn open_flags(&self) -> u32 {
-        if self.is_read() { O_RDONLY } else { O_WRONLY }
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult {
@@ -227,15 +322,27 @@ impl Pollable for Pipe {
         let mut events = IoEvents::empty();
         let buf = self.shared.buffer.lock();
         if self.read_side {
-            let closed = self.closed();
-            // Report IN when there is data to read OR when write end is closed
-            // (read will return 0 = EOF). This matches Linux behavior where
-            // select() reports a pipe as readable when the write end closes.
-            events.set(IoEvents::IN, buf.occupied_len() > 0 || closed);
-            events.set(IoEvents::HUP, closed);
+            events.set(IoEvents::IN, buf.occupied_len() > 0 || self.closed());
+            events.set(IoEvents::HUP, self.closed());
         } else {
-            events.set(IoEvents::OUT, buf.vacant_len() > 0);
+            events.set(IoEvents::OUT, buf.vacant_len() > 0 || self.closed());
+            events.set(IoEvents::ERR, self.closed());
         }
+        stats::record_deep_event(
+            "pipe",
+            format_args!(
+                "poll pipe={:#x} side={} events={:#x} readers={} writers={} len={} cap={} \
+                 nonblock={}",
+                Arc::as_ptr(&self.shared) as usize,
+                if self.read_side { "read" } else { "write" },
+                events.bits(),
+                self.shared.readers.load(Ordering::Acquire),
+                self.shared.writers.load(Ordering::Acquire),
+                buf.occupied_len(),
+                buf.capacity().get(),
+                self.nonblocking()
+            ),
+        );
         events
     }
 

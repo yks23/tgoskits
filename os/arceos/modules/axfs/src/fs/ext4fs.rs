@@ -24,6 +24,7 @@ use ax_fs_vfs::{
     VfsDirEntry, VfsError, VfsNodeAttr, VfsNodeOps, VfsNodePerm, VfsNodeRef, VfsNodeType, VfsOps,
     VfsResult,
 };
+use log::warn;
 use rsext4::{
     Ext4Error, Ext4FileSystem as Rsext4FileSystem, Ext4Result, Ext4Timestamp, Jbd2Dev,
     api::{OpenFile, fs_mount, lseek, open, read_at},
@@ -211,14 +212,20 @@ impl VfsNodeOps for FileWrapper {
     fn create(&self, path: &str, ty: VfsNodeType) -> VfsResult {
         debug!("create {:?} on Ext4fs: {}", ty, path);
         let fpath = self.path_deal_with(path);
+        warn!(
+            "ext4fs_create stage=enter base={} path={} fpath={} ty={:?}",
+            self.path, path, fpath, ty
+        );
         if fpath.is_empty() {
             return Ok(());
         }
 
         let mut fs = self.fs.lock();
+        warn!("ext4fs_create stage=fs_locked fpath={} ty={:?}", fpath, ty);
         match self.inner {
             Ext4Inner::Disk(ref inner) => {
                 let mut inner = inner.lock();
+                warn!("ext4fs_create stage=dev_locked fpath={} ty={:?}", fpath, ty);
                 match ty {
                     VfsNodeType::Dir => {
                         let _ = mkdir(&mut inner, &mut fs, &fpath);
@@ -230,6 +237,7 @@ impl VfsNodeOps for FileWrapper {
             }
             Ext4Inner::Partition(ref inner) => {
                 let mut inner = inner.lock();
+                warn!("ext4fs_create stage=dev_locked fpath={} ty={:?}", fpath, ty);
                 match ty {
                     VfsNodeType::Dir => {
                         let _ = mkdir(&mut inner, &mut fs, &fpath);
@@ -240,6 +248,7 @@ impl VfsNodeOps for FileWrapper {
                 }
             }
         }
+        warn!("ext4fs_create stage=done fpath={} ty={:?}", fpath, ty);
         Ok(())
     }
 

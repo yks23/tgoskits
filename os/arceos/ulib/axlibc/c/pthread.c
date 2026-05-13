@@ -78,7 +78,9 @@ int pthread_cond_broadcast(pthread_cond_t *c)
     return 0;
 }
 
-#define DEFAULT_STACK_SIZE 131072
+/* 128KiB 过小：musl cargo/rustc 会 pthread 创建工作线程，栈溢出会触发 -fstack-protector 的
+ * 「stack smashing detected」（M6 访客自编译等场景）。与常见 Linux 64 位默认量级对齐。 */
+#define DEFAULT_STACK_SIZE (8 * 1024 * 1024)
 #define DEFAULT_GUARD_SIZE 8192
 
 // TODO

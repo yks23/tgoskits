@@ -3,7 +3,6 @@
 use alloc::{sync::Arc, vec, vec::Vec};
 
 use ax_errno::{AxError, AxResult};
-use ax_kspin::SpinNoIrq;
 use ax_sync::Mutex;
 use ax_task::current;
 use hashbrown::HashMap;
@@ -127,7 +126,10 @@ impl FlockInode {
 }
 
 lazy_static::lazy_static! {
-    static ref FLOCK_INODES: SpinNoIrq<HashMap<InodeKey, Arc<Mutex<FlockInode>>>> = SpinNoIrq::new(HashMap::new());
+    /// See `RECORD_INODES` in `record_lock.rs`: avoid `SpinNoIrq` here so
+    /// `flock_inode` → `wait_if` never nests contended `ax_sync::Mutex` sleep
+    /// under local IRQ-disable.
+    static ref FLOCK_INODES: Mutex<HashMap<InodeKey, Arc<Mutex<FlockInode>>>> = Mutex::new(HashMap::new());
 }
 
 fn bucket(key: InodeKey) -> Arc<Mutex<FlockInode>> {

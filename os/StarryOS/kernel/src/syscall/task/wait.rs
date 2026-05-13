@@ -15,7 +15,7 @@ use linux_raw_sys::general::{
 use starry_process::{Pid, Process};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{AsThread, get_task};
+use crate::task::AsThread;
 
 bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -156,7 +156,13 @@ fn wait_children(
         return Err(AxError::from(LinuxError::ECHILD));
     }
 
-    if let Some(child) = children.iter().find(|child| child.is_zombie()) {
+    if let Some(child) = children
+        .iter()
+        .find(|child| child.is_zombie() || child.threads().is_empty())
+    {
+        if !child.is_zombie() {
+            child.exit();
+        }
         let raw_status = child.exit_code();
         if !options.contains(WaitOptions::WNOWAIT) {
             child.free();
@@ -186,7 +192,8 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
     let curr = current();
-    let proc = &curr.as_thread().proc_data.proc;
+    let proc_data = &curr.as_thread().proc_data;
+    let proc = &proc_data.proc;
 
     let pid = if pid == -1 {
         WaitPid::Any
@@ -200,17 +207,14 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
 
     // FIXME: add back support for WALL & WCLONE, since ProcessData may drop before
     // Process now.
-    let proc_data = curr.as_thread().proc_data.clone();
-
     block_on(interruptible(poll_fn(|cx| {
         match wait_children(proc, pid, options, exit_code, core::ptr::null_mut()) {
             Ok(WaitPoll::Found { pid, .. }) => Poll::Ready(Ok(pid as isize)),
             Ok(WaitPoll::NoHang) => Poll::Ready(Ok(0)),
             Ok(WaitPoll::Pending) => {
                 proc_data.child_exit_event.register(cx.waker());
-                // A child may exit between the check above and waker
-                // registration. Recheck after registering so that wakeup is
-                // not lost in that race window.
+                // Close the same lost-wakeup window as waitid: the child can
+                // exit between the first check and registering this waker.
                 match wait_children(proc, pid, options, exit_code, core::ptr::null_mut()) {
                     Ok(WaitPoll::Found { pid, .. }) => Poll::Ready(Ok(pid as isize)),
                     Ok(WaitPoll::NoHang) => Poll::Ready(Ok(0)),

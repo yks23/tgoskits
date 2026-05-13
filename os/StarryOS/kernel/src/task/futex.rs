@@ -6,15 +6,15 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    cmp::Ordering,
     future::poll_fn,
     ops::Deref,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Poll, Waker},
     time::Duration,
 };
 
 use ax_errno::AxResult;
+use ax_kspin::SpinNoIrq;
 use ax_memory_addr::VirtAddr;
 use ax_sync::Mutex;
 use ax_task::{
@@ -31,10 +31,7 @@ use crate::{
 /// Wait queue used by futex.
 #[derive(Default)]
 pub struct WaitQueue {
-    // Futex waits must re-check the user value while serializing with wakeups.
-    // That re-check may fault and sleep, so this queue cannot use a no-IRQ
-    // spinlock.
-    queue: Mutex<VecDeque<(Waker, u32)>>,
+    queue: SpinNoIrq<VecDeque<(Waker, u32, Arc<AtomicBool>)>>,
 }
 impl WaitQueue {
     /// Creates a new `WaitQueue`.
@@ -46,52 +43,94 @@ impl WaitQueue {
     ///
     /// Returns `false` if the condition is not met and no actual waiting
     /// occurs.
+    ///
+    /// **Important:** `condition` must **not** be evaluated while holding
+    /// `self.queue`'s [`SpinNoIrq`] lock: callers often take blocking
+    /// [`ax_sync::Mutex`] inside the closure (e.g. record/flock paths). Doing
+    /// that with IRQs disabled would trip `ax_task::WaitQueue::wait_until` /
+    /// `might_sleep` panics.
     pub fn wait_if(
         &self,
         bitset: u32,
         timeout: Option<Duration>,
-        condition: impl FnOnce() -> bool,
+        mut condition: impl FnMut() -> bool,
     ) -> AxResult<bool> {
-        let mut condition = Some(condition);
-        block_on(interruptible(future::timeout(
+        if !condition() {
+            return Ok(false);
+        }
+        let mut armed = false;
+        let woken = Arc::new(AtomicBool::new(false));
+        let result = block_on(interruptible(future::timeout(
             timeout,
             poll_fn(|cx| {
-                if let Some(cond) = condition.take() {
-                    let mut queue = self.queue.lock();
-                    if !cond() {
-                        Poll::Ready(Ok(false))
-                    } else {
-                        queue.push_back((cx.waker().clone(), bitset));
-                        Poll::Pending
+                if armed {
+                    if woken.load(Ordering::Acquire) {
+                        return Poll::Ready(Ok(true));
                     }
-                } else {
-                    Poll::Ready(Ok(true))
+                    // Re-check outside the futex queue lock (see module doc).
+                    if !condition() {
+                        return Poll::Ready(Ok(false));
+                    }
+                    return Poll::Pending;
                 }
+                if !condition() {
+                    return Poll::Ready(Ok(false));
+                }
+                {
+                    let mut queue = self.queue.lock();
+                    queue.push_back((cx.waker().clone(), bitset, woken.clone()));
+                }
+                armed = true;
+                if woken.load(Ordering::Acquire) {
+                    return Poll::Ready(Ok(true));
+                }
+                if !condition() {
+                    self.remove_waiter(&woken);
+                    return Poll::Ready(Ok(false));
+                }
+                Poll::Pending
             }),
-        )))??
+        )));
+
+        match result {
+            Ok(Ok(waited)) => waited,
+            Ok(Err(err)) => {
+                self.remove_waiter(&woken);
+                Err(err.into())
+            }
+            Err(err) => {
+                self.remove_waiter(&woken);
+                Err(err.into())
+            }
+        }
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given
     /// bitmask.
+    ///
+    /// **Important:** Do not call [`Waker::wake_by_ref`] while holding
+    /// `self.queue`'s [`SpinNoIrq`] lock: a synchronous wake can resume a
+    /// waiter whose `wait_if` closure uses blocking primitives (e.g.
+    /// [`ax_sync::Mutex`], page faults via [`VmPtr::vm_read`]), which requires
+    /// IRQs enabled and trips [`ax_task::api::might_sleep`] panics.
     pub fn wake(&self, count: usize, mask: u32) -> usize {
-        let wakers = {
-            let mut queue = self.queue.lock();
-            let mut wakers = Vec::new();
-
-            queue.retain(|(waker, bitset)| {
-                if wakers.len() >= count || (bitset & mask) == 0 {
+        let mut to_wake: Vec<Waker> = Vec::new();
+        let mut woke = 0;
+        {
+            let mut q = self.queue.lock();
+            q.retain(|(waker, bitset, woken)| {
+                if woke >= count || (bitset & mask) == 0 {
                     true
                 } else {
-                    wakers.push(waker.clone());
+                    woken.store(true, Ordering::Release);
+                    to_wake.push(waker.clone());
+                    woke += 1;
                     false
                 }
             });
-            wakers
-        };
-
-        let woke = wakers.len();
-        for waker in wakers {
-            waker.wake();
+        }
+        for w in to_wake {
+            w.wake_by_ref();
         }
         woke
     }
@@ -101,31 +140,24 @@ impl WaitQueue {
         self.queue.lock().is_empty()
     }
 
-    /// Requeue at most `count` tasks to the target wait queue.
-    pub fn requeue(&self, count: usize, target: &WaitQueue) -> usize {
-        fn requeue_locked(
-            src: &mut VecDeque<(Waker, u32)>,
-            dst: &mut VecDeque<(Waker, u32)>,
-            count: usize,
-        ) -> usize {
-            let count = count.min(src.len());
-            dst.extend(src.drain(..count));
-            count
-        }
+    fn remove_waiter(&self, needle: &Arc<AtomicBool>) {
+        self.queue
+            .lock()
+            .retain(|(_, _, woken)| !Arc::ptr_eq(woken, needle));
+    }
 
-        match core::ptr::from_ref(self).cmp(&core::ptr::from_ref(target)) {
-            Ordering::Less => {
-                let mut src = self.queue.lock();
-                let mut dst = target.queue.lock();
-                requeue_locked(&mut src, &mut dst, count)
-            }
-            Ordering::Greater => {
-                let mut dst = target.queue.lock();
-                let mut src = self.queue.lock();
-                requeue_locked(&mut src, &mut dst, count)
-            }
-            Ordering::Equal => 0,
+    /// Requeue at most `count` tasks to the target wait queue.
+    pub fn requeue(&self, mut count: usize, target: &WaitQueue) -> usize {
+        let tasks: Vec<_> = {
+            let mut wq = self.queue.lock();
+            count = count.min(wq.len());
+            wq.drain(..count).collect()
+        };
+        if !tasks.is_empty() {
+            let mut wq = target.queue.lock();
+            wq.extend(tasks);
         }
+        count
     }
 }
 
@@ -171,7 +203,7 @@ impl FutexKey {
 
     /// Shortcut to create a `FutexKey` for the current task's address space.
     pub fn new_current(address: usize) -> Self {
-        Self::new(&current().as_thread().proc_data.aspace().lock(), address)
+        Self::new(&current().as_thread().proc_data.aspace.lock(), address)
     }
 
     fn as_usize(&self) -> usize {

@@ -242,8 +242,13 @@ impl OpenOptions {
         if !self.is_valid() {
             return Err(VfsError::InvalidInput);
         }
+        let path = path.as_ref();
+        if path.as_str().is_empty() {
+            return Err(VfsError::NotFound);
+        }
+        let has_trailing_slash = path.as_str().len() > 1 && path.as_str().ends_with('/');
 
-        let loc = match context.resolve_parent(path.as_ref()) {
+        let loc = match context.resolve_parent(path) {
             Ok((parent, name)) => {
                 let mut loc = parent.open_file(
                     &name,
@@ -259,6 +264,12 @@ impl OpenOptions {
                     loc = context
                         .with_current_dir(parent)?
                         .try_resolve_symlink(loc, &mut 0)?;
+                }
+                if self.no_follow && !self.path && loc.node_type() == NodeType::Symlink {
+                    return Err(VfsError::FilesystemLoop);
+                }
+                if has_trailing_slash {
+                    loc.check_is_dir()?;
                 }
                 loc
             }

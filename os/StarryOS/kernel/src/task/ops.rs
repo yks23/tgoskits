@@ -18,7 +18,7 @@ use super::{
     AsThread, FutexKey, ProcessData, TimerState, futex_table_for, send_signal_thread_inner,
     send_signal_to_process, send_signal_to_thread,
 };
-use crate::file::{flock, record_lock};
+use crate::file::{close_file_table_for_exit, flock, record_lock};
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 
@@ -32,7 +32,6 @@ static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap:
 ///
 /// This function is intended to be used during memory leak analysis to remove
 /// possible noise caused by expired entries in the [`WeakMap`].
-#[cfg(feature = "memtrack")]
 pub fn cleanup_task_tables() {
     TASK_TABLE.write().cleanup();
     PROCESS_TABLE.write().cleanup();
@@ -77,6 +76,11 @@ pub fn tasks() -> Vec<AxTaskRef> {
     TASK_TABLE.read().values().collect()
 }
 
+/// Try to list all tasks without blocking on the task table lock.
+pub fn try_tasks() -> Option<Vec<AxTaskRef>> {
+    TASK_TABLE.try_read().map(|table| table.values().collect())
+}
+
 /// Finds the task with the given TID.
 pub fn get_task(tid: Pid) -> AxResult<AxTaskRef> {
     if tid == 0 {
@@ -118,16 +122,9 @@ pub fn get_process_group(pgid: Pid) -> AxResult<Arc<ProcessGroup>> {
         .ok_or(AxError::NoSuchProcess)
 }
 
-/// Registers a process group in the global table.
-pub fn register_process_group(pg: &Arc<ProcessGroup>) {
-    let mut pg_table = PROCESS_GROUP_TABLE.write();
-    pg_table.insert(pg.pgid(), pg);
-}
-
-/// Registers a session in the global table.
-pub fn register_session(session: &Arc<Session>) {
-    let mut session_table = SESSION_TABLE.write();
-    session_table.insert(session.sid(), session);
+/// Finds the session with the given SID.
+pub fn get_session(sid: Pid) -> AxResult<Arc<Session>> {
+    SESSION_TABLE.read().get(&sid).ok_or(AxError::NoSuchProcess)
 }
 
 /// Poll the timer
@@ -192,16 +189,27 @@ fn handle_futex_death(entry: *mut RobustList, offset: i64) -> AxResult<()> {
 
 pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
     // Reference: https://elixir.bootlin.com/linux/v6.13.6/source/kernel/futex/core.c#L777
+    //
+    // Never dereference `head` as a kernel pointer: it is a user VMA address.
+    // Compare walk termination against `&user_head->list` using byte offset only.
 
     let mut limit = ROBUST_LIST_LIMIT;
 
-    let end_ptr = unsafe { &raw const (*head).list };
+    let head_addr = head.addr();
+    let list_off = core::mem::offset_of!(RobustListHead, list);
+    let end_ptr = head_addr
+        .checked_add(list_off)
+        .ok_or(AxError::InvalidInput)? as *mut RobustList;
+
     let head = head.vm_read()?;
     let mut entry = head.list.next;
     let offset = head.futex_offset;
     let pending = head.list_op_pending;
 
     while !core::ptr::eq(entry, end_ptr) {
+        if entry.is_null() {
+            return Err(AxError::BadAddress);
+        }
         let next_entry = entry.vm_read()?.next;
         if entry != pending {
             handle_futex_death(entry, offset)?;
@@ -215,11 +223,6 @@ pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
         ax_task::yield_now();
     }
 
-    // Process the pending entry that was skipped in the loop
-    if !pending.is_null() {
-        handle_futex_death(pending, offset)?;
-    }
-
     Ok(())
 }
 
@@ -230,7 +233,8 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     info!("{} exit with code: {}", curr.id_name(), exit_code);
 
     // CLONE_VFORK: if our parent is blocked on us, release it now.
-    thr.proc_data.notify_vfork_done();
+    // Safe to call multiple times — release_vfork_parent() takes() the slot.
+    thr.release_vfork_parent();
 
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
     if clear_child_tid.vm_write(0).is_ok() {
@@ -256,16 +260,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         let pid = process.pid();
         flock::release_all_for_pid(pid);
         record_lock::release_posix_for_pid(pid);
-
-        // Close all file descriptors before marking the process as exited.
-        // This ensures pipe write ends and other resources are properly released,
-        // so parent processes blocking on pipe reads will receive EOF.
-        crate::file::close_all_fds();
-
-        // Snapshot children BEFORE process.exit() reparents them to init
-        // via mem::take. Otherwise process.children() returns an empty
-        // list and pdeathsig never reaches the real children.
-        let children_snapshot = process.children();
+        close_file_table_for_exit();
         process.exit();
         if let Some(parent) = process.parent() {
             if let Some(signo) = thr.proc_data.exit_signal {
@@ -275,27 +270,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
                 data.child_exit_event.wake();
             }
         }
-        // Send pdeathsig to child processes
-        for child in children_snapshot {
-            let child_pid = child.pid();
-            if let Ok(child_task) = get_task(child_pid)
-                && let Some(child_thr) = child_task.try_as_thread()
-            {
-                let sig = child_thr.pdeathsig();
-                if sig > 0
-                    && let Some(signo) = Signo::from_repr(sig as u8)
-                {
-                    let _ = send_signal_to_process(child_pid, Some(SignalInfo::new_kernel(signo)));
-                }
-            }
-        }
-
         thr.proc_data.exit_event.wake();
 
-        // Unblock a vfork parent waiting for this child to exit.
-        thr.proc_data.notify_vfork_done();
-
-        crate::syscall::clear_proc_shm(process.pid(), &thr.proc_data.aspace());
+        crate::syscall::SHM_MANAGER
+            .lock()
+            .clear_proc_shm(process.pid());
     }
     thr.exit_event.wake();
 

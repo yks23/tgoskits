@@ -5,6 +5,7 @@ mod mm;
 mod net;
 mod resources;
 mod signal;
+pub mod stats;
 mod sync;
 mod sys;
 mod task;
@@ -20,9 +21,23 @@ pub use self::{
 };
 
 pub fn handle_syscall(uctx: &mut UserContext) {
+    let raw_sysno = uctx.sysno() as u32;
+    stats::record_raw_syscall(raw_sysno);
+    let args = [
+        uctx.arg0(),
+        uctx.arg1(),
+        uctx.arg2(),
+        uctx.arg3(),
+        uctx.arg4(),
+        uctx.arg5(),
+    ];
+    stats::record_syscall_enter(raw_sysno, args);
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
         warn!("Invalid syscall number: {}", uctx.sysno());
-        uctx.set_retval(-LinuxError::ENOSYS.code() as _);
+        let retval = -LinuxError::ENOSYS.code() as isize;
+        stats::record_syscall_exit(raw_sysno, retval);
+        stats::trace_syscall(raw_sysno, "invalid", retval);
+        uctx.set_retval(retval as _);
         return;
     };
 
@@ -390,6 +405,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::getrusage => sys_getrusage(uctx.arg0() as _, uctx.arg1() as _),
 
         // task sched
+        Sysno::restart_syscall => sys_restart_syscall(),
         Sysno::sched_yield => sys_sched_yield(),
         Sysno::nanosleep => sys_nanosleep(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::clock_nanosleep => sys_clock_nanosleep(
@@ -562,6 +578,14 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::seccomp => sys_seccomp(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         #[cfg(target_arch = "riscv64")]
         Sysno::riscv_flush_icache => sys_riscv_flush_icache(),
+        #[cfg(target_arch = "riscv64")]
+        Sysno::riscv_hwprobe => sys_riscv_hwprobe(
+            uctx.arg0() as *mut (),
+            uctx.arg1() as usize,
+            uctx.arg2() as usize,
+            uctx.arg3() as *mut u8,
+            uctx.arg4() as u32,
+        ),
 
         // sync
         Sysno::membarrier => sys_membarrier(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
@@ -707,5 +731,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     };
     debug!("Syscall {sysno} return {result:?}");
 
-    uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+    let retval = result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as isize;
+    stats::record_syscall_exit(raw_sysno, retval);
+    stats::trace_syscall(raw_sysno, sysno, retval);
+    uctx.set_retval(retval as _);
 }

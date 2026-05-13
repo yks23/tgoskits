@@ -5,6 +5,8 @@ use ax_io::prelude::*;
 use bytemuck::AnyBitPattern;
 use starry_vm::{VmPtr, vm_read_slice, vm_write_slice};
 
+use super::{UserConstPtr, UserPtr};
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, AnyBitPattern)]
 pub struct IoVec {
@@ -33,6 +35,66 @@ impl IoVectorBuf {
             len += iov.iov_len as usize;
         }
         Ok(Self { iovs, iovcnt, len })
+    }
+
+    pub fn read_with(
+        self,
+        mut f: impl FnMut(*const u8, usize) -> AxResult<usize>,
+    ) -> AxResult<usize> {
+        let mut count = 0;
+        for i in 0..self.iovcnt {
+            let iov = self.iovs.wrapping_add(i).vm_read()?;
+            if iov.iov_len == 0 {
+                continue;
+            }
+            let read = f(iov.iov_base, iov.iov_len as usize)?;
+            if read == 0 {
+                break;
+            }
+            count += read;
+        }
+        Ok(count)
+    }
+
+    pub fn fill_with(
+        self,
+        mut f: impl FnMut(*mut u8, usize) -> AxResult<usize>,
+    ) -> AxResult<usize> {
+        let mut count = 0;
+        for i in 0..self.iovcnt {
+            let iov = self.iovs.wrapping_add(i).vm_read()?;
+            if iov.iov_len == 0 {
+                continue;
+            }
+            let written = f(iov.iov_base, iov.iov_len as usize)?;
+            if written == 0 {
+                break;
+            }
+            count += written;
+        }
+        Ok(count)
+    }
+
+    pub fn prepare_read(&self) -> AxResult<()> {
+        for i in 0..self.iovcnt {
+            let iov = self.iovs.wrapping_add(i).vm_read()?;
+            if iov.iov_len == 0 {
+                continue;
+            }
+            UserConstPtr::from(iov.iov_base as *const u8).get_as_slice(iov.iov_len as usize)?;
+        }
+        Ok(())
+    }
+
+    pub fn prepare_write(&self) -> AxResult<()> {
+        for i in 0..self.iovcnt {
+            let iov = self.iovs.wrapping_add(i).vm_read()?;
+            if iov.iov_len == 0 {
+                continue;
+            }
+            UserPtr::from(iov.iov_base).get_as_mut_slice(iov.iov_len as usize)?;
+        }
+        Ok(())
     }
 
     pub fn into_io(self) -> IoVectorBufIo {

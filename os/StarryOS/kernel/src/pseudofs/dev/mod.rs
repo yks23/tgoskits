@@ -17,6 +17,7 @@ mod r#loop;
 #[cfg(feature = "memtrack")]
 mod memtrack;
 mod rtc;
+mod syscall_stats_mm;
 pub mod tty;
 
 use alloc::{format, sync::Arc};
@@ -274,6 +275,16 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             NodeType::CharacterDevice,
             DeviceId::new(10, 1024),
             Arc::new(CpuDmaLatency),
+        ),
+    );
+
+    root.add(
+        "syscall_stats_mm",
+        Device::new(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            syscall_stats_mm::SYSCALL_STATS_MM_DEVICE_ID,
+            Arc::new(syscall_stats_mm::SyscallStatsMm),
         ),
     );
 

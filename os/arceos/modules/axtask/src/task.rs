@@ -283,6 +283,9 @@ impl TaskInner {
     #[inline]
     pub fn interrupt(&self) {
         self.interrupted.store(true, Ordering::Release);
+        if self.id == crate::current().id() || self.state() != TaskState::Blocked {
+            return;
+        }
         self.interrupt_waker.wake();
     }
 }

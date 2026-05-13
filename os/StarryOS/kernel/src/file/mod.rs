@@ -8,8 +8,8 @@ mod pipe;
 pub(crate) mod record_lock;
 pub mod signalfd;
 
-use alloc::{borrow::Cow, sync::Arc};
-use core::{ffi::c_int, time::Duration};
+use alloc::{borrow::Cow, sync::Arc, vec::Vec};
+use core::{ffi::c_int, sync::atomic::AtomicU32, time::Duration};
 
 use ax_errno::{AxError, AxResult};
 use ax_fs::{FS_CONTEXT, FileBackend, FileFlags, OpenOptions};
@@ -20,7 +20,8 @@ use axpoll::Pollable;
 use downcast_rs::{DowncastSync, impl_downcast};
 use flatten_objects::FlattenObjects;
 use linux_raw_sys::general::{
-    O_RDONLY, O_WRONLY, RLIMIT_NOFILE, STATX_BASIC_STATS, stat, statx, statx_timestamp,
+    O_RDONLY, O_WRONLY, RLIMIT_NOFILE, STATX_BASIC_STATS, STATX_MNT_ID, stat, statx,
+    statx_timestamp,
 };
 use spin::RwLock;
 
@@ -102,11 +103,9 @@ impl From<Kstat> for statx {
     fn from(value: Kstat) -> Self {
         // SAFETY: valid for statx
         let mut statx: statx = unsafe { core::mem::zeroed() };
-        // We always populate the basic stats; Linux returns the same mask.
-        // `stx_attributes` is left zero — it reports FS-specific flags we do
-        // not track.
-        statx.stx_mask = STATX_BASIC_STATS;
+        statx.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID;
         statx.stx_blksize = value.blksize as _;
+        statx.stx_attributes = 0;
         statx.stx_nlink = value.nlink as _;
         statx.stx_uid = value.uid as _;
         statx.stx_gid = value.gid as _;
@@ -114,6 +113,7 @@ impl From<Kstat> for statx {
         statx.stx_ino = value.ino as _;
         statx.stx_size = value.size as _;
         statx.stx_blocks = value.blocks as _;
+        statx.stx_attributes_mask = 0;
         statx.stx_rdev_major = value.rdev.major();
         statx.stx_rdev_minor = value.rdev.minor();
 
@@ -160,11 +160,7 @@ pub trait FileLike: Pollable + DowncastSync {
     fn path(&self) -> Cow<'_, str>;
 
     fn file_mmap(&self) -> AxResult<(FileBackend, FileFlags)> {
-        // man 2 mmap ENODEV: "The underlying filesystem of the specified file
-        // does not support memory mapping." This is the right errno for fd
-        // kinds that do not back onto a mappable file (directory, pipe,
-        // socket, epoll, eventfd, etc.).
-        Err(AxError::NoSuchDevice)
+        Err(AxError::BadFileDescriptor)
     }
 
     fn device_mmap(&self, _offset: u64) -> AxResult<DeviceMmap> {
@@ -173,10 +169,6 @@ pub trait FileLike: Pollable + DowncastSync {
 
     fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(AxError::NotATty)
-    }
-
-    fn open_flags(&self) -> u32 {
-        0
     }
 
     fn nonblocking(&self) -> bool {
@@ -209,6 +201,8 @@ impl_downcast!(sync FileLike);
 pub struct FileDescriptor {
     pub inner: Arc<dyn FileLike>,
     pub cloexec: bool,
+    /// File status flags shared by duplicated descriptors for this open file description.
+    pub status_flags: Arc<AtomicU32>,
 }
 
 scope_local::scope_local! {
@@ -227,13 +221,62 @@ pub fn get_file_like(fd: c_int) -> AxResult<Arc<dyn FileLike>> {
 
 /// Add a file to the file descriptor table.
 pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
+    add_file_like_with_status_flags(f, cloexec, 0)
+}
+
+/// Add a file to the file descriptor table with initial file status flags.
+pub fn add_file_like_with_status_flags(
+    f: Arc<dyn FileLike>,
+    cloexec: bool,
+    status_flags: u32,
+) -> AxResult<c_int> {
     let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current;
     let mut table = FD_TABLE.write();
     if table.count() as u64 >= max_nofile {
         return Err(AxError::TooManyOpenFiles);
     }
-    let fd = FileDescriptor { inner: f, cloexec };
+    let fd = FileDescriptor {
+        inner: f,
+        cloexec,
+        status_flags: Arc::new(AtomicU32::new(status_flags)),
+    };
     Ok(table.add(fd).map_err(|_| AxError::TooManyOpenFiles)? as c_int)
+}
+
+/// Add a descriptor to the descriptor table using the lowest available fd.
+pub fn add_file_descriptor(fd: FileDescriptor) -> AxResult<c_int> {
+    let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current;
+    let mut table = FD_TABLE.write();
+    if table.count() as u64 >= max_nofile {
+        return Err(AxError::TooManyOpenFiles);
+    }
+    Ok(table.add(fd).map_err(|_| AxError::TooManyOpenFiles)? as c_int)
+}
+
+/// Add a descriptor to the descriptor table using the lowest available fd >= `min_fd`.
+pub fn add_file_descriptor_from(desc: FileDescriptor, min_fd: c_int) -> AxResult<c_int> {
+    if min_fd < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current;
+    let min_fd = min_fd as usize;
+    if min_fd as u64 >= max_nofile {
+        return Err(AxError::InvalidInput);
+    }
+
+    let mut table = FD_TABLE.write();
+    if table.count() as u64 >= max_nofile {
+        return Err(AxError::TooManyOpenFiles);
+    }
+
+    let end = (max_nofile as usize).min(AX_FILE_LIMIT);
+    let Some(fd) = (min_fd..end).find(|fd| !table.is_assigned(*fd)) else {
+        return Err(AxError::TooManyOpenFiles);
+    };
+    Ok(table
+        .add_at(fd, desc)
+        .map_err(|_| AxError::TooManyOpenFiles)? as c_int)
 }
 
 /// Close a file by `fd`.
@@ -256,63 +299,51 @@ pub fn close_file_like(fd: c_int) -> AxResult {
     Ok(())
 }
 
-/// Close all open file descriptors for the current process.
+/// Close every descriptor owned by the current process fd table on process exit.
 ///
-/// This must be called when a process exits, so that pipe write ends and other
-/// resources are properly released. Without this, parent processes blocking on
-/// pipe reads will never receive EOF.
-pub fn close_all_fds() {
-    // CLONE_FILES may share the same fd table across multiple tasks/processes.
-    // In that case, an exiting sharer must not clear the whole table, or other
-    // live sharers (including the parent) will lose stdout/stderr unexpectedly.
-    if Arc::strong_count(&FD_TABLE) > 1 {
+/// A table shared via `CLONE_FILES` must stay alive for the remaining sharers; in
+/// that case the final drop of the shared `Arc` will release the descriptors.
+pub fn close_file_table_for_exit() {
+    if Arc::strong_count(&*FD_TABLE) != 1 {
         return;
     }
 
-    let mut table = FD_TABLE.write();
-    let ids: alloc::vec::Vec<usize> = table.ids().collect();
-    let mut removed = alloc::vec::Vec::with_capacity(ids.len());
-    for id in ids {
-        match table.remove(id) {
-            Some(fd) => removed.push(fd),
-            None => warn!("close_all_fds: fd {id} disappeared during close sweep"),
-        }
+    let fds = FD_TABLE.read().ids().collect::<Vec<_>>();
+    for fd in fds {
+        let _ = close_file_like(fd as c_int);
     }
-    drop(table);
-
-    // Drop removed descriptors after releasing FD_TABLE lock to avoid
-    // lock re-entry or side effects from destructor paths.
-    drop(removed);
 }
 
 pub fn add_stdio(fd_table: &mut FlattenObjects<FileDescriptor, AX_FILE_LIMIT>) -> AxResult<()> {
     assert_eq!(fd_table.count(), 0);
     let cx = FS_CONTEXT.lock();
-    let open = |options: &mut OpenOptions, flags| {
+    let open = |options: &mut OpenOptions| {
         AxResult::Ok(Arc::new(File::new(
             options.open(&cx, "/dev/console")?.into_file()?,
-            flags,
         )))
     };
 
-    let tty_in = open(OpenOptions::new().read(true).write(false), O_RDONLY as _)?;
-    let tty_out = open(OpenOptions::new().read(false).write(true), O_WRONLY as _)?;
+    let tty_in = open(OpenOptions::new().read(true).write(false))?;
+    let tty_out = open(OpenOptions::new().read(false).write(true))?;
     fd_table
         .add(FileDescriptor {
             inner: tty_in,
             cloexec: false,
+            status_flags: Arc::new(AtomicU32::new(O_RDONLY)),
         })
         .map_err(|_| AxError::TooManyOpenFiles)?;
     fd_table
         .add(FileDescriptor {
             inner: tty_out.clone(),
             cloexec: false,
+            status_flags: Arc::new(AtomicU32::new(O_WRONLY)),
         })
         .map_err(|_| AxError::TooManyOpenFiles)?;
     fd_table
         .add(FileDescriptor {
             inner: tty_out,
             cloexec: false,
+            status_flags: Arc::new(AtomicU32::new(O_WRONLY)),
         })
         .map_err(|_| AxError::TooManyOpenFiles)?;
 

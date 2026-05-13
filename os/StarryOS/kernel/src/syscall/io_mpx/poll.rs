@@ -1,4 +1,5 @@
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
+use core::fmt::Write as _;
 
 use ax_errno::{AxError, AxResult};
 use ax_hal::time::TimeValue;
@@ -11,10 +12,25 @@ use super::FdPollSet;
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
-    syscall::signal::check_sigset_size,
+    syscall::{signal::check_sigset_size, stats},
     task::with_blocked_signals,
     time::TimeValueLike,
 };
+
+fn poll_fds_summary(poll_fds: &[pollfd]) -> String {
+    let mut out = String::new();
+    for (idx, fd) in poll_fds.iter().take(8).enumerate() {
+        let _ = write!(
+            out,
+            "{}:fd={} events={:#x} revents={:#x};",
+            idx, fd.fd, fd.events, fd.revents
+        );
+    }
+    if poll_fds.len() > 8 {
+        let _ = write!(out, "...(+{})", poll_fds.len() - 8);
+    }
+    out
+}
 
 fn do_poll(
     poll_fds: &mut [pollfd],
@@ -22,6 +38,17 @@ fn do_poll(
     sigmask: Option<SignalSet>,
 ) -> AxResult<isize> {
     debug!("do_poll fds={poll_fds:?} timeout={timeout:?}");
+    if stats::deep_trace_enabled() {
+        stats::record_deep_event(
+            "poll",
+            format_args!(
+                "enter nfds={} timeout={:?} fds={}",
+                poll_fds.len(),
+                timeout,
+                poll_fds_summary(poll_fds)
+            ),
+        );
+    }
 
     let mut res = 0isize;
     let mut fds = Vec::with_capacity(poll_fds.len());
@@ -48,11 +75,21 @@ fn do_poll(
         }
     }
     if res > 0 {
+        if stats::deep_trace_enabled() {
+            stats::record_deep_event(
+                "poll",
+                format_args!(
+                    "exit_invalid ready={} fds={}",
+                    res,
+                    poll_fds_summary(poll_fds)
+                ),
+            );
+        }
         return Ok(res);
     }
     let fds = FdPollSet(fds);
 
-    with_blocked_signals(sigmask, || {
+    let result = with_blocked_signals(sigmask, || {
         match block_on(future::timeout(
             timeout,
             poll_io(&fds, IoEvents::empty(), false, || {
@@ -87,7 +124,18 @@ fn do_poll(
             Ok(r) => r,
             Err(_) => Ok(0),
         }
-    })
+    });
+    if stats::deep_trace_enabled() {
+        stats::record_deep_event(
+            "poll",
+            format_args!(
+                "exit result={:?} fds={}",
+                result,
+                poll_fds_summary(poll_fds)
+            ),
+        );
+    }
+    result
 }
 
 #[cfg(target_arch = "x86_64")]

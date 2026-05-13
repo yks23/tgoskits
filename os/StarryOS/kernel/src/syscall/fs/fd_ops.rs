@@ -1,26 +1,36 @@
-use alloc::{format, string::ToString, sync::Arc};
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+};
 use core::{
     ffi::{c_char, c_int},
     mem::{self, size_of},
     ops::{Deref, DerefMut},
+    sync::atomic::Ordering,
 };
 
 use ax_errno::{AxError, AxResult, LinuxError};
 use ax_fs::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
 use ax_io::{Seek, SeekFrom};
 use ax_task::current;
-use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Reference, path::Path};
+use axfs_ng_vfs::{DirEntry, FileNode, Location, NodeType, Reference, path::Path};
 use bitflags::bitflags;
 use linux_raw_sys::general::{RESOLVE_BENEATH, open_how, *};
 use starry_vm::VmPtr;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileLike, Pipe, add_file_like, close_file_like, flock,
-        get_file_like, record_lock, with_fs,
+        Directory, FD_TABLE, File, FileLike, Pipe, add_file_descriptor, add_file_descriptor_from,
+        add_file_like_with_status_flags, close_file_like, flock, get_file_like, record_lock,
+        with_fs,
     },
     mm::{UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
+    syscall::{
+        stats,
+        sys::{sys_getegid, sys_geteuid},
+    },
     task::AsThread,
 };
 
@@ -29,25 +39,36 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
     let flags = flags as u32;
     let mut options = OpenOptions::new();
     options.mode(mode).user(uid, gid);
-    match flags & 0b11 {
-        O_RDONLY => options.read(true),
-        O_WRONLY => options.write(true),
-        _ => options.read(true).write(true),
-    };
-    if flags & O_APPEND != 0 {
-        options.append(true);
-    }
-    if flags & O_TRUNC != 0 {
-        options.truncate(true);
-    }
-    if flags & O_CREAT != 0 {
-        options.create(true);
-    }
     if flags & O_PATH != 0 {
         options.path(true);
-    }
-    if flags & O_EXCL != 0 {
-        options.create_new(true);
+        // Linux ignores most status/creation flags with O_PATH. Keep a read
+        // bit only because axfs-ng currently requires one before adding PATH.
+        options.read(true);
+    } else {
+        match flags & ACCESS_MODE_MASK {
+            O_RDONLY => {
+                options.read(true);
+            }
+            O_WRONLY => {
+                options.write(true);
+            }
+            O_RDWR => {
+                options.read(true).write(true);
+            }
+            _ => {}
+        };
+        if flags & O_APPEND != 0 {
+            options.append(true);
+        }
+        if flags & O_TRUNC != 0 {
+            options.truncate(true);
+        }
+        if flags & O_CREAT != 0 {
+            options.create(true);
+        }
+        if flags & O_EXCL != 0 {
+            options.create_new(true);
+        }
     }
     if flags & O_DIRECTORY != 0 {
         options.directory(true);
@@ -55,10 +76,148 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
     if flags & O_NOFOLLOW != 0 {
         options.no_follow(true);
     }
-    if flags & O_DIRECT != 0 {
+    if flags & O_DIRECT != 0 && flags & O_PATH == 0 {
         options.direct(true);
     }
     options
+}
+
+const ACCESS_MODE_MASK: u32 = 0b11;
+const SETFL_MUTABLE_FLAGS: u32 = O_NONBLOCK | O_APPEND;
+
+fn open_status_flags(flags: u32) -> u32 {
+    if flags & O_PATH != 0 {
+        flags & (O_PATH | O_DIRECTORY | O_NOFOLLOW)
+    } else {
+        flags & (ACCESS_MODE_MASK | O_APPEND | O_NONBLOCK | O_DIRECTORY | O_NOFOLLOW | O_DIRECT)
+    }
+}
+
+fn linux_ret_from_error(err: AxError) -> isize {
+    -LinuxError::from(err).code() as isize
+}
+
+fn location_path(loc: &Location) -> String {
+    loc.absolute_path()
+        .map_or_else(|_| "<path-error>".to_string(), |path| path.to_string())
+}
+
+fn openat_context_paths() -> (String, String) {
+    FS_CONTEXT.try_lock().map_or_else(
+        || ("<fs-busy>".to_string(), "<fs-busy>".to_string()),
+        |fs| {
+            (
+                location_path(fs.current_dir()),
+                location_path(fs.root_dir()),
+            )
+        },
+    )
+}
+
+fn openat_base_path(dirfd: c_int, path: &str) -> String {
+    if Path::new(path).is_absolute() {
+        return "<absolute-uses-root>".to_string();
+    }
+    if dirfd == AT_FDCWD {
+        return FS_CONTEXT.try_lock().map_or_else(
+            || "<cwd-busy>".to_string(),
+            |fs| location_path(fs.current_dir()),
+        );
+    }
+    Directory::from_fd(dirfd).map_or_else(
+        |err| format!("<dirfd-error:{err:?}>"),
+        |dir| location_path(dir.inner()),
+    )
+}
+
+fn openat_path_branch(dirfd: c_int, path: &str) -> &'static str {
+    if path.is_empty() {
+        "empty"
+    } else if Path::new(path).is_absolute() {
+        "absolute"
+    } else if dirfd == AT_FDCWD {
+        "relative_cwd"
+    } else {
+        "relative_dirfd"
+    }
+}
+
+fn trace_openat(
+    stage: &str,
+    dirfd: c_int,
+    path: &str,
+    flags: i32,
+    mode: __kernel_mode_t,
+    detail: core::fmt::Arguments<'_>,
+) {
+    if !stats::deep_trace_enabled() {
+        return;
+    }
+    let curr = current();
+    let thread = curr.as_thread();
+    let regs = thread.user_regs_snapshot();
+    let (cwd, root) = openat_context_paths();
+    let base = openat_base_path(dirfd, path);
+    let detail = format!("{detail}");
+    let task_name = curr.name().to_string();
+    let raw_flags = flags as u32;
+    stats::record_deep_event(
+        "openat",
+        format_args!(
+            "stage={} pid={} tid={} task={} user_pc={:#x} user_sp={:#x} dirfd={} path={:?} \
+             flags={:#x} mode={:#o} branch={} cwd={:?} root={:?} base={:?} o_directory={} \
+             o_nofollow={} o_creat={} o_excl={} o_trunc={} o_cloexec={} trailing_slash={} {}",
+            stage,
+            thread.proc_data.proc.pid(),
+            curr.id().as_u64(),
+            task_name,
+            regs.pc,
+            regs.sp,
+            dirfd,
+            path,
+            flags,
+            mode,
+            openat_path_branch(dirfd, path),
+            cwd,
+            root,
+            base,
+            raw_flags & O_DIRECTORY != 0,
+            raw_flags & O_NOFOLLOW != 0,
+            raw_flags & O_CREAT != 0,
+            raw_flags & O_EXCL != 0,
+            raw_flags & O_TRUNC != 0,
+            raw_flags & O_CLOEXEC != 0,
+            path.len() > 1 && path.ends_with('/'),
+            detail,
+        ),
+    );
+    warn!(
+        "deep_openat stage={} pid={} tid={} task={} user_pc={:#x} user_sp={:#x} dirfd={} \
+         path={:?} flags={:#x} mode={:#o} branch={} cwd={:?} root={:?} base={:?} o_directory={} \
+         o_nofollow={} o_creat={} o_excl={} o_trunc={} o_cloexec={} trailing_slash={} {}",
+        stage,
+        thread.proc_data.proc.pid(),
+        curr.id().as_u64(),
+        task_name,
+        regs.pc,
+        regs.sp,
+        dirfd,
+        path,
+        flags,
+        mode,
+        openat_path_branch(dirfd, path),
+        cwd,
+        root,
+        base,
+        raw_flags & O_DIRECTORY != 0,
+        raw_flags & O_NOFOLLOW != 0,
+        raw_flags & O_CREAT != 0,
+        raw_flags & O_EXCL != 0,
+        raw_flags & O_TRUNC != 0,
+        raw_flags & O_CLOEXEC != 0,
+        path.len() > 1 && path.ends_with('/'),
+        detail,
+    );
 }
 
 fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
@@ -99,14 +258,14 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                     file = ax_fs::File::new(FileBackend::Direct(loc), file.flags());
                 }
             }
-            Arc::new(File::new(file, flags))
+            Arc::new(File::new(file))
         }
         OpenResult::Dir(dir) => Arc::new(Directory::new(dir)),
     };
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    add_file_like(f, flags & O_CLOEXEC != 0)
+    add_file_like_with_status_flags(f, flags & O_CLOEXEC != 0, open_status_flags(flags))
 }
 
 /// Open or create a file.
@@ -123,14 +282,130 @@ pub fn sys_openat(
 ) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_openat <= {dirfd} {path:?} {flags:#o} {mode:#o}");
+    stats::record_deep_event(
+        "openat",
+        format_args!(
+            "openat_enter dirfd={} path={:?} flags={:#x} mode={:#o}",
+            dirfd, path, flags, mode
+        ),
+    );
+    trace_openat("enter", dirfd, &path, flags, mode, format_args!(""));
 
     let mode = mode & !current().as_thread().proc_data.umask();
 
-    let cred = current().as_thread().cred();
-    let options = flags_to_options(flags, mode, (cred.fsuid, cred.fsgid));
-    with_fs(dirfd, |fs| options.open(fs, path))
-        .and_then(|it| add_to_fd(it, flags as _))
-        .map(|fd| fd as isize)
+    let mut options = flags_to_options(flags, mode, (sys_geteuid()? as _, sys_getegid()? as _));
+    if flags as u32 & O_PATH == 0
+        && (path.ends_with("/.package-cache") || path.ends_with("/.global-cache"))
+    {
+        stats::record_deep_event(
+            "openat",
+            format_args!(
+                "openat_cargo_cache_marker_direct path={:?} flags={:#x}",
+                path, flags
+            ),
+        );
+        options.direct(true);
+    }
+    let effective_dirfd = if Path::new(path.as_str()).is_absolute() {
+        AT_FDCWD
+    } else {
+        dirfd
+    };
+    trace_openat(
+        "path_walk_step",
+        dirfd,
+        &path,
+        flags,
+        mode,
+        format_args!("effective_dirfd={}", effective_dirfd),
+    );
+    let opened = with_fs(effective_dirfd, |fs| options.open(fs, path.clone()));
+    let opened = match opened {
+        Ok(opened) => {
+            stats::record_deep_event(
+                "openat",
+                format_args!(
+                    "openat_open_ok dirfd={} path={:?} flags={:#x}",
+                    dirfd, path, flags
+                ),
+            );
+            let opened_kind = match &opened {
+                OpenResult::File(file) => {
+                    format!("opened=file target={:?}", location_path(file.location()))
+                }
+                OpenResult::Dir(dir) => format!("opened=dir target={:?}", location_path(dir)),
+            };
+            trace_openat(
+                "open_ok",
+                dirfd,
+                &path,
+                flags,
+                mode,
+                format_args!("{}", opened_kind),
+            );
+            opened
+        }
+        Err(err) => {
+            let ret = linux_ret_from_error(err);
+            let errno = LinuxError::from(err);
+            stats::record_deep_event(
+                "openat",
+                format_args!(
+                    "openat_err dirfd={} path={:?} flags={:#x} mode={:#o} ret={} errno={:?} \
+                     err={:?}",
+                    dirfd, path, flags, mode, ret, errno, err
+                ),
+            );
+            trace_openat(
+                "exit",
+                dirfd,
+                &path,
+                flags,
+                mode,
+                format_args!("ret={} errno={:?} err={:?}", ret, errno, err),
+            );
+            return Err(err);
+        }
+    };
+    stats::record_deep_event(
+        "openat",
+        format_args!("openat_add_fd_enter path={:?} flags={:#x}", path, flags),
+    );
+    if stats::deep_trace_enabled() {
+        warn!(
+            "deep_openat stage=add_fd_enter path={:?} flags={:#x}",
+            path, flags
+        );
+    }
+    let fd = match add_to_fd(opened, flags as _) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let ret = linux_ret_from_error(err);
+            let errno = LinuxError::from(err);
+            trace_openat(
+                "exit",
+                dirfd,
+                &path,
+                flags,
+                mode,
+                format_args!("ret={} errno={:?} err={:?}", ret, errno, err),
+            );
+            return Err(err);
+        }
+    };
+    stats::record_deep_event(
+        "openat",
+        format_args!("openat_add_fd_ok path={:?} fd={}", path, fd),
+    );
+    trace_openat(
+        "exit",
+        dirfd,
+        &path,
+        flags,
+        mode,
+        format_args!("ret={} fd={}", fd, fd),
+    );
+    Ok(fd as isize)
 }
 
 fn path_lexically_stays_beneath(rel: &str) -> bool {
@@ -251,8 +526,30 @@ pub fn sys_close_range(first: i32, last: i32, flags: u32) -> AxResult<isize> {
 }
 
 fn dup_fd(old_fd: c_int, cloexec: bool) -> AxResult<isize> {
-    let f = get_file_like(old_fd)?;
-    let new_fd = add_file_like(f, cloexec)?;
+    if old_fd < 0 {
+        return Err(AxError::BadFileDescriptor);
+    }
+    let mut desc = FD_TABLE
+        .read()
+        .get(old_fd as _)
+        .cloned()
+        .ok_or(AxError::BadFileDescriptor)?;
+    desc.cloexec = cloexec;
+    let new_fd = add_file_descriptor(desc)?;
+    Ok(new_fd as _)
+}
+
+fn dup_fd_from(old_fd: c_int, min_fd: c_int, cloexec: bool) -> AxResult<isize> {
+    if old_fd < 0 {
+        return Err(AxError::BadFileDescriptor);
+    }
+    let mut desc = FD_TABLE
+        .read()
+        .get(old_fd as _)
+        .cloned()
+        .ok_or(AxError::BadFileDescriptor)?;
+    desc.cloexec = cloexec;
+    let new_fd = add_file_descriptor_from(desc, min_fd)?;
     Ok(new_fd as _)
 }
 
@@ -283,6 +580,9 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
 
     if old_fd == new_fd {
         return Err(AxError::InvalidInput);
+    }
+    if old_fd < 0 || new_fd < 0 {
+        return Err(AxError::BadFileDescriptor);
     }
 
     let mut fd_table = FD_TABLE.write();
@@ -345,8 +645,14 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
     debug!("sys_fcntl <= fd: {fd} cmd: {cmd} arg: {arg}");
 
     match cmd as u32 {
-        F_DUPFD => dup_fd(fd, false),
-        F_DUPFD_CLOEXEC => dup_fd(fd, true),
+        F_DUPFD => dup_fd_from(
+            fd,
+            arg.try_into().map_err(|_| AxError::InvalidInput)?,
+            false,
+        ),
+        F_DUPFD_CLOEXEC => {
+            dup_fd_from(fd, arg.try_into().map_err(|_| AxError::InvalidInput)?, true)
+        }
         F_SETLK | F_SETLKW => {
             let file = File::from_fd(fd)?;
             let key = lock_inode_key(&file)?;
@@ -403,15 +709,29 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             Ok(file.fasync_get().1 as isize)
         }
         F_SETFL => {
-            get_file_like(fd)?.set_nonblocking(arg & (O_NONBLOCK as usize) > 0)?;
+            let arg = u32::try_from(arg).map_err(|_| AxError::InvalidInput)?;
+            let desc = FD_TABLE
+                .read()
+                .get(fd as _)
+                .cloned()
+                .ok_or(AxError::BadFileDescriptor)?;
+            desc.inner.set_nonblocking(arg & O_NONBLOCK != 0)?;
+            let current = desc.status_flags.load(Ordering::Acquire);
+            let next = (current & !SETFL_MUTABLE_FLAGS) | (arg & SETFL_MUTABLE_FLAGS);
+            desc.status_flags.store(next, Ordering::Release);
             Ok(0)
         }
         F_GETFL => {
-            let f = get_file_like(fd)?;
-
-            let mut ret = f.open_flags();
-            if f.nonblocking() {
+            let desc = FD_TABLE
+                .read()
+                .get(fd as _)
+                .cloned()
+                .ok_or(AxError::BadFileDescriptor)?;
+            let mut ret = desc.status_flags.load(Ordering::Acquire);
+            if desc.inner.nonblocking() {
                 ret |= O_NONBLOCK;
+            } else {
+                ret &= !O_NONBLOCK;
             }
 
             Ok(ret as _)

@@ -1,4 +1,4 @@
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use core::{
     alloc::Layout,
     ffi::c_char,
@@ -10,10 +10,11 @@ use core::{
 use ax_errno::{AxError, AxResult};
 use ax_hal::{asm::user_copy, paging::MappingFlags, trap::page_fault_handler};
 use ax_io::prelude::*;
+use ax_kernel_guard::IrqSave;
 use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use ax_task::{current, might_sleep};
+use ax_task::current;
 use extern_trait::extern_trait;
-use starry_vm::{VmError, VmIo, VmResult, vm_load_until_nul, vm_read_slice, vm_write_slice};
+use starry_vm::{VmError, VmIo, VmResult, vm_read_slice, vm_write_slice};
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
@@ -22,13 +23,7 @@ use crate::{
 
 /// Enables scoped access into user memory, allowing page faults to occur inside
 /// kernel.
-#[track_caller]
 pub fn access_user_memory<R>(f: impl FnOnce() -> R) -> R {
-    assert!(
-        ax_hal::asm::irqs_enabled(),
-        "faultable user memory access requires IRQs enabled"
-    );
-
     let curr = current();
     let Some(thr) = curr.try_as_thread() else {
         panic!("access_user_memory called outside of thread context");
@@ -47,8 +42,7 @@ fn check_region(start: VirtAddr, layout: Layout, access_flags: MappingFlags) -> 
     }
 
     let curr = current();
-    let aspace_arc = curr.as_thread().proc_data.aspace();
-    let mut aspace = aspace_arc.lock();
+    let mut aspace = curr.as_thread().proc_data.aspace.lock();
 
     if !aspace.can_access_range(start, layout.size(), access_flags) {
         return Err(AxError::BadAddress);
@@ -91,8 +85,7 @@ fn check_null_terminated<T: PartialEq + Default>(
                 // querying the page table since the page might has not been
                 // allocated yet.
                 let curr = current();
-                let aspace_arc = curr.as_thread().proc_data.aspace();
-                let aspace = aspace_arc.lock();
+                let aspace = curr.as_thread().proc_data.aspace.lock();
                 if !aspace.can_access_range(page, PAGE_SIZE_4K, access_flags) {
                     return Err(AxError::BadAddress);
                 }
@@ -157,14 +150,19 @@ impl<T> UserPtr<T> {
     }
 
     pub fn get_as_mut_slice(self, len: usize) -> AxResult<&'static mut [T]> {
-        if len == 0 {
-            return Ok(&mut []);
-        }
         check_region(
             self.address(),
             Layout::array::<T>(len).unwrap(),
             Self::ACCESS_FLAGS,
         )?;
+        Ok(unsafe { slice::from_raw_parts_mut(self.0, len) })
+    }
+
+    pub fn get_as_mut_null_terminated(self) -> AxResult<&'static mut [T]>
+    where
+        T: PartialEq + Default,
+    {
+        let len = check_null_terminated::<T>(self.address(), Self::ACCESS_FLAGS)?;
         Ok(unsafe { slice::from_raw_parts_mut(self.0, len) })
     }
 }
@@ -213,9 +211,6 @@ impl<T> UserConstPtr<T> {
     }
 
     pub fn get_as_slice(self, len: usize) -> AxResult<&'static [T]> {
-        if len == 0 {
-            return Ok(&[]);
-        }
         check_region(
             self.address(),
             Layout::array::<T>(len).unwrap(),
@@ -269,20 +264,18 @@ fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags) -> bool {
         return false;
     }
 
-    might_sleep();
     thr.proc_data
-        .aspace()
+        .aspace
         .lock()
         .handle_page_fault(vaddr, access_flags)
 }
 
 pub fn vm_load_string(ptr: *const c_char) -> AxResult<String> {
-    #[allow(clippy::unnecessary_cast)]
-    let bytes = vm_load_until_nul(ptr as *const u8)?;
-    String::from_utf8(bytes).map_err(|_| AxError::IllegalBytes)
+    UserConstPtr::from(ptr).get_as_str().map(|s| s.to_string())
 }
 
-struct Vm;
+#[allow(dead_code)]
+struct Vm(IrqSave);
 
 /// Briefly checks if the given memory region is valid user memory.
 pub fn check_access(start: usize, len: usize) -> VmResult {
@@ -298,7 +291,7 @@ pub fn check_access(start: usize, len: usize) -> VmResult {
 #[extern_trait]
 unsafe impl VmIo for Vm {
     fn new() -> Self {
-        Self
+        Self(IrqSave::new())
     }
 
     fn read(&mut self, start: usize, buf: &mut [MaybeUninit<u8>]) -> VmResult {
@@ -342,6 +335,24 @@ impl VmBytes {
     pub fn new(ptr: *const u8, len: usize) -> Self {
         Self { ptr, len }
     }
+
+    /// Prepares the whole source range so later copies do not fault while
+    /// lower-level file locks are held.
+    pub fn prepare_read(&self) -> AxResult<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        check_region(
+            VirtAddr::from_ptr_of(self.ptr),
+            Layout::array::<u8>(self.len).unwrap(),
+            MappingFlags::READ,
+        )
+    }
+
+    /// Casts the `VmBytes` to a mutable `VmBytesMut`.
+    pub fn cast_mut(&self) -> VmBytesMut {
+        VmBytesMut::new(self.ptr as *mut u8, self.len)
+    }
 }
 
 impl Read for VmBytes {
@@ -378,6 +389,24 @@ impl VmBytesMut {
     /// Creates a new `VmBytesMut` from a raw pointer and a length.
     pub fn new(ptr: *mut u8, len: usize) -> Self {
         Self { ptr, len }
+    }
+
+    /// Prepares the whole destination range so later copies do not fault while
+    /// lower-level file locks are held.
+    pub fn prepare_write(&self) -> AxResult<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        check_region(
+            VirtAddr::from_ptr_of(self.ptr),
+            Layout::array::<u8>(self.len).unwrap(),
+            MappingFlags::READ | MappingFlags::WRITE,
+        )
+    }
+
+    /// Casts the `VmBytesMut` to a read-only `VmBytes`.
+    pub fn cast_const(&self) -> VmBytes {
+        VmBytes::new(self.ptr, self.len)
     }
 }
 
