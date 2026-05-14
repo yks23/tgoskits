@@ -258,7 +258,7 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                     file = ax_fs::File::new(FileBackend::Direct(loc), file.flags());
                 }
             }
-            Arc::new(File::new(file))
+            Arc::new(File::new(file, flags))
         }
         OpenResult::Dir(dir) => Arc::new(Directory::new(dir)),
     };

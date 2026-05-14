@@ -1,5 +1,6 @@
 //! User task management.
 
+mod cred;
 mod futex;
 mod ops;
 mod resources;
@@ -28,7 +29,21 @@ use starry_signal::{
 };
 
 pub use self::{futex::*, ops::*, resources::*, signal::*, stat::*, timer::*, user::*};
+pub use self::cred::Cred;
 use crate::mm::AddrSpace;
+
+/// Length of the syscall trap instruction (in bytes), used to adjust the
+/// saved PC backwards when restarting an interrupted syscall (SA_RESTART).
+#[cfg(target_arch = "riscv64")]
+pub const SYSCALL_INSN_LEN: usize = 2; // ecall
+#[cfg(target_arch = "riscv32")]
+pub const SYSCALL_INSN_LEN: usize = 2; // ecall
+#[cfg(target_arch = "aarch64")]
+pub const SYSCALL_INSN_LEN: usize = 4; // svc #0
+#[cfg(target_arch = "x86_64")]
+pub const SYSCALL_INSN_LEN: usize = 2; // syscall
+#[cfg(target_arch = "loongarch64")]
+pub const SYSCALL_INSN_LEN: usize = 4; // syscall 0
 
 ///  A wrapper type that assumes the inner type is `Sync`.
 #[repr(transparent)]
@@ -97,6 +112,12 @@ pub struct Thread {
     /// sequences.
     rseq_area: AtomicUsize,
 
+    /// Per-thread flag: when set, the next signal check on the return path
+    /// from a syscall (specifically `rt_sigreturn`) is skipped. This is used
+    /// so that the signal handler return path doesn't immediately re-deliver
+    /// the signal it just handled.
+    skip_signal_check: AtomicBool,
+
     /// Set when the thread was created via `clone(CLONE_VFORK)` or `vfork(2)`.
     /// While non-`None`, the parent task is blocked on this `PollSet` waiting
     /// for the child to release its hold on the parent's address space (i.e.
@@ -125,6 +146,7 @@ impl Thread {
             accessing_user_memory: AtomicBool::new(false),
             exit_event: Arc::default(),
             rseq_area: AtomicUsize::new(0),
+            skip_signal_check: AtomicBool::new(false),
             vfork_done: spin::Mutex::new(None),
             user_pc: AtomicUsize::new(0),
             user_sp: AtomicUsize::new(0),
@@ -210,6 +232,20 @@ impl Thread {
         self.rseq_area.store(addr, Ordering::SeqCst);
     }
 
+    /// Set the per-thread flag to skip the next signal check.
+    /// Called from `rt_sigreturn` so the return-to-user path does not
+    /// immediately re-deliver the signal just handled.
+    pub fn block_next_signal_check(&self) {
+        self.skip_signal_check.store(true, Ordering::SeqCst);
+    }
+
+    /// Atomically clear the skip-next-signal-check flag and return its
+    /// previous value. The caller uses this to decide whether to suppress
+    /// signal delivery for one iteration.
+    pub fn unblock_next_signal_check(&self) -> bool {
+        self.skip_signal_check.swap(false, Ordering::SeqCst)
+    }
+
     pub fn record_user_regs(&self, pc: usize, sp: usize, ra: usize, tp: usize) {
         self.user_pc.store(pc, Ordering::Relaxed);
         self.user_sp.store(sp, Ordering::Relaxed);
@@ -223,6 +259,23 @@ impl Thread {
             sp: self.user_sp.load(Ordering::Relaxed),
             ra: self.user_ra.load(Ordering::Relaxed),
             tp: self.user_tp.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Build a snapshot of the process credentials from the ProcessData fields.
+    pub fn cred(&self) -> Cred {
+        let (ruid, euid, suid) = self.proc_data.res_uids();
+        let (rgid, egid, sgid) = self.proc_data.res_gids();
+        Cred {
+            uid: ruid,
+            gid: rgid,
+            euid,
+            egid,
+            suid,
+            sgid,
+            fsuid: euid,
+            fsgid: egid,
+            groups: Arc::from([].as_slice()),
         }
     }
 }
@@ -455,5 +508,11 @@ impl ProcessData {
         self.rgid.store(rgid, Ordering::Relaxed);
         self.egid.store(egid, Ordering::Relaxed);
         self.sgid.store(sgid, Ordering::Relaxed);
+    }
+
+    /// Return accumulated CPU time of reaped children.
+    /// TODO: track actual children CPU time; returns zeros for now.
+    pub fn children_cpu_time(&self) -> (ax_hal::time::TimeValue, ax_hal::time::TimeValue) {
+        (ax_hal::time::TimeValue::ZERO, ax_hal::time::TimeValue::ZERO)
     }
 }

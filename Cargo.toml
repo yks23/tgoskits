@@ -354,11 +354,6 @@ log = "0.4"
 spin = "0.10"
 ostool = { version = "0.15" }
 
-# === drivers ===
-rk3588-clk = {  version = "0.1.3", path = "drivers/rk3588-clk" }
-rockchip-pm = {  version = "0.4.1", path = "drivers/rockchip-pm" }
-rockchip-npu = {  version = "0.1", path = "drivers/rockchip-npu" }
-
 # Vendored git dependency (pin 9e9942d9…): avoids cargo git-fetch when GitHub is flaky.
 # Source unpacked from GitHub archive; see vendor/arm-scmi/README if present.
 [patch."https://github.com/drivercraft/arm-scmi"]

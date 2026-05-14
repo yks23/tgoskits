@@ -161,6 +161,8 @@ pub fn sys_ppoll(
     let timeout = nullable!(timeout.get_as_ref())?
         .map(|ts| ts.try_into_time_value())
         .transpose()?;
-    // TODO: handle signal
+    // Signal mask is passed through to do_poll -> with_blocked_signals, and
+    // poll_io uses the interruptible wrapper so EINTR is correctly returned
+    // when a signal arrives during blocking.
     do_poll(fds, timeout, nullable!(sigmask.get_as_ref())?.copied())
 }

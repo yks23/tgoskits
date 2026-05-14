@@ -155,6 +155,18 @@ pub fn sys_fdatasync(fd: c_int) -> AxResult<isize> {
     Ok(0)
 }
 
+pub fn sys_sync_file_range(
+    fd: c_int,
+    offset: __kernel_off_t,
+    nbytes: __kernel_off_t,
+    flags: u32,
+) -> AxResult<isize> {
+    debug!("sys_sync_file_range <= fd: {fd}, offset: {offset}, nbytes: {nbytes}, flags: {flags}");
+    // Stub: delegate to fdatasync for now.
+    let _ = (offset, nbytes, flags);
+    sys_fdatasync(fd)
+}
+
 pub fn sys_fadvise64(
     fd: c_int,
     offset: __kernel_off_t,

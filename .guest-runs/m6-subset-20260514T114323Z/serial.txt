@@ -1,0 +1,1 @@
+qemu-system-riscv64: -drive id=disk0,if=none,format=raw,file=/Users/txc/code/Auto-OS/tgoskits/.guest-runs/rootfs-selfbuild-riscv64.img,file.locking=off: Could not open '/Users/txc/code/Auto-OS/tgoskits/.guest-runs/rootfs-selfbuild-riscv64.img': No such file or directory

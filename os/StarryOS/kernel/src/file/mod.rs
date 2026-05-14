@@ -179,6 +179,10 @@ pub trait FileLike: Pollable + DowncastSync {
         Ok(())
     }
 
+    fn open_flags(&self) -> u32 {
+        0
+    }
+
     fn from_fd(fd: c_int) -> AxResult<Arc<Self>>
     where
         Self: Sized + 'static,
@@ -317,14 +321,15 @@ pub fn close_file_table_for_exit() {
 pub fn add_stdio(fd_table: &mut FlattenObjects<FileDescriptor, AX_FILE_LIMIT>) -> AxResult<()> {
     assert_eq!(fd_table.count(), 0);
     let cx = FS_CONTEXT.lock();
-    let open = |options: &mut OpenOptions| {
+    let open = |options: &mut OpenOptions, flags: u32| {
         AxResult::Ok(Arc::new(File::new(
             options.open(&cx, "/dev/console")?.into_file()?,
+            flags,
         )))
     };
 
-    let tty_in = open(OpenOptions::new().read(true).write(false))?;
-    let tty_out = open(OpenOptions::new().read(false).write(true))?;
+    let tty_in = open(OpenOptions::new().read(true).write(false), O_RDONLY)?;
+    let tty_out = open(OpenOptions::new().read(false).write(true), O_WRONLY)?;
     fd_table
         .add(FileDescriptor {
             inner: tty_in,

@@ -61,6 +61,14 @@ pub fn sys_setreuid(ruid: u32, euid: u32) -> AxResult<isize> {
     Ok(0)
 }
 
+pub fn sys_setregid(rgid: u32, egid: u32) -> AxResult<isize> {
+    let task = current();
+    let pd = task.as_thread().proc_data.as_ref();
+    let sgid = pd.res_gids().2;
+    pd.set_res_gids(rgid, egid, sgid);
+    Ok(0)
+}
+
 pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> AxResult<isize> {
     current()
         .as_thread()

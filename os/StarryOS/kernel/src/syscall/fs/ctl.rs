@@ -374,6 +374,13 @@ pub fn sys_readlinkat(
 
     debug!("sys_readlinkat <= dirfd: {dirfd}, path: {path:?}");
 
+    // Linux returns ENOENT for empty pathname — there is no link target to read.
+    // Without this check resolve_no_follow("") would return the current directory
+    // and read_link() would then produce EINVAL instead of the correct ENOENT.
+    if path.is_empty() {
+        return Err(AxError::NotFound);
+    }
+
     with_fs(dirfd, |fs| {
         let entry = fs.resolve_no_follow(path.clone()).inspect_err(|err| {
             stats::record_deep_event(

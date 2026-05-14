@@ -127,6 +127,16 @@ pub fn get_session(sid: Pid) -> AxResult<Arc<Session>> {
     SESSION_TABLE.read().get(&sid).ok_or(AxError::NoSuchProcess)
 }
 
+/// Register a process group in the global table (idempotent).
+pub fn register_process_group(pg: &Arc<ProcessGroup>) {
+    PROCESS_GROUP_TABLE.write().insert(pg.pgid(), pg);
+}
+
+/// Register a session in the global table (idempotent).
+pub fn register_session(session: &Arc<Session>) {
+    SESSION_TABLE.write().insert(session.sid(), session);
+}
+
 /// Poll the timer
 pub fn poll_timer(task: &TaskInner) {
     let Some(thr) = task.try_as_thread() else {
@@ -272,9 +282,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         }
         thr.proc_data.exit_event.wake();
 
-        crate::syscall::SHM_MANAGER
-            .lock()
-            .clear_proc_shm(process.pid());
+        crate::syscall::clear_proc_shm(process.pid(), &thr.proc_data.aspace);
     }
     thr.exit_event.wake();
 

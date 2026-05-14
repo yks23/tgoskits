@@ -84,21 +84,20 @@ pub fn page_fault_handler(addr: VirtAddr, flags: PageFaultFlags) -> bool {
     default_page_fault_handler(addr, flags)
 }
 
-/// Invoke the page-fault slow path with the IRQ state restored to the
-/// faulting context.
+/// Invoke the page-fault slow path with IRQs enabled.
+///
+/// Page fault handling may need to take sleeping locks (e.g., aspace mutex)
+/// and is never atomic — always enable IRQs unconditionally, matching how
+/// Linux enables interrupts early in `do_page_fault` before acquiring mmap_lock.
 #[inline]
 pub(crate) fn call_page_fault_handler_with_parent_irqs(
     addr: VirtAddr,
     flags: PageFaultFlags,
-    parent_irqs_enabled: bool,
+    _parent_irqs_enabled: bool,
 ) -> bool {
-    if parent_irqs_enabled {
-        crate::asm::enable_irqs();
-    }
+    crate::asm::enable_irqs();
     let handled = page_fault_handler(addr, flags);
-    if parent_irqs_enabled {
-        crate::asm::disable_irqs();
-    }
+    crate::asm::disable_irqs();
     handled
 }
 

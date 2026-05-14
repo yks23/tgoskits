@@ -391,7 +391,6 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
-            uctx.arg4(),
         ),
         Sysno::madvise => sys_madvise(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::msync => sys_msync(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
@@ -733,6 +732,21 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
     let retval = result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as isize;
     stats::record_syscall_exit(raw_sysno, retval);
+
+    // Always log clone/execve/exit_group at info level for fork debugging
+    match sysno {
+        Sysno::clone | Sysno::clone3 => {
+            info!("syscall_dispatch clone flags={:#x} ret={retval}", uctx.arg0());
+        }
+        Sysno::execve | Sysno::execveat => {
+            info!("syscall_dispatch execve ret={retval}");
+        }
+        Sysno::exit_group => {
+            info!("syscall_dispatch exit_group code={}", uctx.arg0());
+        }
+        _ => {}
+    }
+
     stats::trace_syscall(raw_sysno, sysno, retval);
     uctx.set_retval(retval as _);
 }

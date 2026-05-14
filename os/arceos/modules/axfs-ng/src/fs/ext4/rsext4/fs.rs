@@ -3,6 +3,7 @@ use core::cell::OnceCell;
 
 use ax_driver::{AxBlockDevice, PartitionRegion};
 use ax_kspin::{SpinNoPreempt as Mutex, SpinNoPreemptGuard as MutexGuard};
+use ax_sync::Mutex as AxSyncMutex;
 use axfs_ng_vfs::{
     DirEntry, DirNode, Filesystem, FilesystemOps, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
 };
@@ -37,6 +38,31 @@ impl Ext4Filesystem {
 
         let fs = Arc::new(Self {
             inner: Mutex::new(Ext4State { fs, dev }),
+            root_dir: OnceCell::new(),
+        });
+        let _ = fs.root_dir.set(DirEntry::new_dir(
+            |this| {
+                DirNode::new(Inode::new(
+                    fs.clone(),
+                    InodeNumber::new(EXT4_ROOT_INO).unwrap(),
+                    Some(this),
+                    Some("/".into()),
+                ))
+            },
+            Reference::root(),
+        ));
+        Ok(Filesystem::new(fs))
+    }
+
+    pub fn new_shared(
+        dev: Arc<AxSyncMutex<AxBlockDevice>>,
+        region: PartitionRegion,
+    ) -> VfsResult<Filesystem> {
+        let mut disk_dev = Jbd2Dev::initial_jbd2dev(0, Ext4Disk::new_shared(dev, region), true);
+        let fs = rsext4::mount(&mut disk_dev).map_err(into_vfs_err)?;
+
+        let fs = Arc::new(Self {
+            inner: Mutex::new(Ext4State { fs, dev: disk_dev }),
             root_dir: OnceCell::new(),
         });
         let _ = fs.root_dir.set(DirEntry::new_dir(

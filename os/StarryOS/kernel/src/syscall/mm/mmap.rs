@@ -187,7 +187,7 @@ pub fn sys_mmap(
             if let Some(ref file) = file {
                 // Try device mmap first (ExportedGemBuffer, etc.)
                 if let Ok(device_mmap) = file.device_mmap(offset as u64) {
-                    match device_mmap {
+                    let backend = match device_mmap {
                         DeviceMmap::Physical(mut range) => {
                             range.start += offset;
                             if range.is_empty() {
@@ -195,12 +195,16 @@ pub fn sys_mmap(
                             }
                             length = length.min(range.size().align_down(page_size));
                             Backend::new_linear(
+                                start,
                                 start.as_usize() as isize - range.start.as_usize() as isize,
-                            );
+                                true,
+                            )
                         }
                         DeviceMmap::None => return Err(AxError::NoSuchDevice),
                         _ => return Err(AxError::InvalidInput),
-                    }
+                    };
+                    aspace.map(start, length, permission_flags.into(), false, backend)?;
+                    return Ok(start.as_usize() as _);
                 }
 
                 // Fall through to file-backed mmap
@@ -214,6 +218,7 @@ pub fn sys_mmap(
                             flags,
                             offset,
                             &curr.as_thread().proc_data.aspace,
+                            true,
                         )
                     }
                     FileBackend::Direct(loc) => {
@@ -226,25 +231,25 @@ pub fn sys_mmap(
                             DeviceMmap::None => {
                                 return Err(AxError::NoSuchDevice);
                             }
-                            DeviceMmap::ReadOnly => {
-                                Backend::new_cow(start, page_size, backend, offset as u64, None)
-                            }
-                            DeviceMmap::Physical(range) => {
-                                if range.is_empty() {
-                                    return Err(AxError::InvalidInput);
-                                }
-                                length = capped_device_map_len(length, range.size(), page_size);
-                                Backend::new_linear(
-                                    start.as_usize() as isize - range.start.as_usize() as isize,
-                                )
-                            }
                             DeviceMmap::Cache(cache) => Backend::new_file(
                                 start,
                                 cache,
                                 flags,
                                 offset,
                                 &curr.as_thread().proc_data.aspace,
+                                true,
                             ),
+                            DeviceMmap::Physical(range) => {
+                                if range.is_empty() {
+                                    return Err(AxError::InvalidInput);
+                                }
+                                length = capped_device_map_len(length, range.size(), page_size);
+                                Backend::new_linear(
+                                    start,
+                                    start.as_usize() as isize - range.start.as_usize() as isize,
+                                    true,
+                                )
+                            }
                         }
                     }
                 }
@@ -256,9 +261,9 @@ pub fn sys_mmap(
             if let Some(ref file) = file {
                 // Private file-backed mmap
                 let (backend, _) = file.file_mmap()?;
-                Backend::new_cow(start, page_size, backend, offset as u64, None)
+                Backend::new_cow(start, page_size, backend, offset as u64, None, false)
             } else {
-                Backend::new_alloc(start, page_size)
+                Backend::new_alloc(start, page_size, "anonymous")
             }
         }
         _ => return Err(AxError::InvalidInput),

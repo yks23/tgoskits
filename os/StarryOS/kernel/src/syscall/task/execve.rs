@@ -184,7 +184,9 @@ fn apply_execve_image(
     // keeps pointing at the original still-live AddrSpace.
     let new_pt_root = new_aspace.page_table_root();
     let newaspace_arc = Arc::new(Mutex::new(new_aspace));
-    proc_data.replace_aspace(newaspace_arc);
+    // SAFETY: vfork forbids CLONE_THREAD, so this ProcessData has no sibling
+    // threads racing on the aspace slot.
+    unsafe { proc_data.replace_aspace(newaspace_arc) };
 
     // Switch the hardware page table now that the new aspace is installed.
     curr.switch_page_table(new_pt_root);
@@ -215,8 +217,6 @@ fn apply_execve_image(
     // CLONE_VFORK semantics: the child has now installed a brand-new image,
     // so release the vfork parent (no-op when not a vfork child).
     curr.as_thread().release_vfork_parent();
-    // Also notify via WaitQueue for posix_spawn-style vfork.
-    proc_data.notify_vfork_done();
 
     Ok(0)
 }

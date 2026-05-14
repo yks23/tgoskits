@@ -54,7 +54,7 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
                 expand_size,
                 MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
                 false,
-                Backend::new_alloc(expand_start, PageSize::Size4K),
+                Backend::new_alloc(expand_start, PageSize::Size4K, "heap"),
             )?;
         }
     } else if new_top_aligned < current_top_aligned {

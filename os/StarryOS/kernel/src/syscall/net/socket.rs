@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use ax_errno::{AxError, AxResult, LinuxError};
 use ax_task::current;
 #[cfg(feature = "vsock")]
@@ -39,19 +40,19 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             if proto != 0 && proto != IPPROTO_TCP as _ {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
-            SocketInner::Tcp(TcpSocket::new())
+            SocketInner::Tcp(Box::new(TcpSocket::new()))
         }
         (AF_INET | AF_INET6, SOCK_DGRAM) => {
             if proto != 0 && proto != IPPROTO_UDP as _ {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
-            SocketInner::Udp(UdpSocket::new())
+            SocketInner::Udp(Box::new(UdpSocket::new()))
         }
-        (AF_UNIX, SOCK_STREAM) => SocketInner::Unix(UnixSocket::new(StreamTransport::new(pid))),
-        (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(DgramTransport::new(pid))),
+        (AF_UNIX, SOCK_STREAM) => SocketInner::Unix(Box::new(UnixSocket::new(StreamTransport::new(pid)))),
+        (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(Box::new(UnixSocket::new(DgramTransport::new(pid)))),
         #[cfg(feature = "vsock")]
         (AF_VSOCK, SOCK_STREAM) => {
-            SocketInner::Vsock(VsockSocket::new(VsockStreamTransport::new()))
+            SocketInner::Vsock(Box::new(VsockSocket::new(VsockStreamTransport::new())))
         }
         (AF_INET | AF_INET6, _) | (AF_UNIX, _) | (AF_VSOCK, _) => {
             warn!("Unsupported socket type: domain: {domain}, ty: {ty}");
@@ -104,7 +105,7 @@ pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    Socket::from_fd(fd)?.listen()?;
+    Socket::from_fd(fd)?.listen(backlog as _)?;
 
     Ok(0)
 }
@@ -186,8 +187,8 @@ pub fn sys_socketpair(
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
     };
-    let sock1 = Socket::new(SocketInner::Unix(sock1), AF_UNIX as u32);
-    let sock2 = Socket::new(SocketInner::Unix(sock2), AF_UNIX as u32);
+    let sock1 = Socket::new(SocketInner::Unix(Box::new(sock1)), AF_UNIX as u32);
+    let sock2 = Socket::new(SocketInner::Unix(Box::new(sock2)), AF_UNIX as u32);
 
     if raw_ty & O_NONBLOCK != 0 {
         sock1.set_nonblocking(true)?;

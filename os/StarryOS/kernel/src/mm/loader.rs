@@ -251,6 +251,25 @@ impl ElfLoader {
             ldso.as_ref()
                 .map_or_else(|| elf.entry(), |ldso| ldso.entry()),
         );
+        let e_type = elf.headers().header.pt2.type_().as_type();
+        let type_name = match e_type {
+            xmas_elf::header::Type::None => "NONE",
+            xmas_elf::header::Type::Relocatable => "REL",
+            xmas_elf::header::Type::Executable => "EXEC",
+            xmas_elf::header::Type::SharedObject => "DYN",
+            xmas_elf::header::Type::Core => "CORE",
+            xmas_elf::header::Type::ProcessorSpecific(_) => "PROC",
+        };
+        info!("ELF loader: entry={:#x} elf.base={:#x} elf.e_entry={:#x} e_type={} ldso={}",
+              entry, elf.base(), elf.headers().header.pt2.entry_point(),
+              type_name, ldso.is_some());
+        if entry.as_usize() == 0 {
+            let mut hdr = alloc::vec![0u8; 64];
+            let cache_ref = self.0.front().unwrap();
+            let n = cache_ref.borrow_cache().read_at(&mut hdr[..], 0).unwrap_or(0);
+            hdr.truncate(n);
+            warn!("ELF entry is ZERO! first {} bytes: {:02x?}", n, &hdr[..n.min(64)]);
+        }
         let auxv = elf
             .aux_vector(PAGE_SIZE_4K, ldso.map(|elf| elf.base()))
             .collect::<Vec<_>>();
