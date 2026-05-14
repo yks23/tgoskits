@@ -8,6 +8,10 @@ use super::{
     AsThread, SYSCALL_INSN_LEN, Thread, do_exit, get_process_data, get_process_group, get_task,
 };
 
+fn record_signal_stat(sig: &SignalInfo) {
+    crate::syscall::stats::record_signal_delivery(sig.signo() as u32);
+}
+
 /// Information needed to restart a syscall if SA_RESTART applies.
 pub struct SyscallRestartInfo {
     /// First argument register value before the syscall overwrote it.
@@ -104,6 +108,7 @@ pub fn send_signal_to_thread(tgid: Option<Pid>, tid: Pid, sig: Option<SignalInfo
 
     if let Some(sig) = sig {
         info!("Send signal {:?} to thread {}", sig.signo(), tid);
+        record_signal_stat(&sig);
         send_signal_thread_inner(&task, thread, sig);
     }
 
@@ -117,6 +122,7 @@ pub fn send_signal_to_process(pid: Pid, sig: Option<SignalInfo>) -> AxResult<()>
     if let Some(sig) = sig {
         let signo = sig.signo();
         info!("Send signal {signo:?} to process {pid}");
+        record_signal_stat(&sig);
         if let Some(tid) = proc_data.signal.send_signal(sig)
             && let Ok(task) = get_task(tid)
             && signo != Signo::SIGCHLD
@@ -134,6 +140,7 @@ pub fn send_signal_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> AxRes
 
     if let Some(sig) = sig {
         info!("Send signal {:?} to process group {}", sig.signo(), pgid);
+        record_signal_stat(&sig);
         for proc in pg.processes() {
             send_signal_to_process(proc.pid(), Some(sig.clone()))?;
         }
@@ -149,6 +156,7 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
 
     let signo = sig.signo();
     info!("Send fatal signal {signo:?} to the current process");
+    record_signal_stat(&sig);
     if let Some(tid) = proc_data.signal.send_signal(sig)
         && let Ok(task) = get_task(tid)
     {

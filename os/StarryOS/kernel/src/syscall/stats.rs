@@ -12,7 +12,7 @@ use alloc::{
 };
 use core::{
     fmt::Write as _,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, Ordering::Relaxed},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering, Ordering::Relaxed},
 };
 
 use ax_hal::{
@@ -34,6 +34,8 @@ const TASK_SYSCALL_CAP: usize = 64;
 const TASK_TOP_SYSCALLS: usize = 8;
 const TASK_WINDOW_NS: u64 = 5_000_000_000;
 const TASK_NAME_MAX: usize = 16;
+const SIGNAL_SLOTS: usize = 32; // signo 1..31 + margin
+const ERRNO_HISTOGRAM_SLOTS: usize = 128; // errno 1..127
 
 /// 与 mmap 页布局一致，用户态可按 `u64` + `u32` + `u32` 解析前 16 字节。
 #[repr(C, align(4096))]
@@ -62,6 +64,32 @@ static DEEP_PATH_SEQ: AtomicU64 = AtomicU64::new(0);
 static TASK_SAMPLE_SEQ: AtomicU64 = AtomicU64::new(0);
 static DEEP_TIMER_LAST_SEC: AtomicU64 = AtomicU64::new(0);
 static DEEP_TIMER_SNAPSHOT_LAST_SEC: AtomicU64 = AtomicU64::new(0);
+// ── Error counters ── per-syscall error count + errno histogram
+static ERROR_COUNTERS: [AtomicU64; SYSCALL_STATS_SLOTS] =
+    [const { AtomicU64::new(0) }; SYSCALL_STATS_SLOTS];
+static ERRNO_HISTOGRAM: [AtomicU64; ERRNO_HISTOGRAM_SLOTS] =
+    [const { AtomicU64::new(0) }; ERRNO_HISTOGRAM_SLOTS];
+static TOTAL_ERRORS: AtomicU64 = AtomicU64::new(0);
+static LAST_ERROR_NR: AtomicU32 = AtomicU32::new(0);
+static LAST_ERROR_RET: AtomicI64 = AtomicI64::new(0);
+
+// ── Page fault counters ──
+static PF_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PF_HANDLED: AtomicU64 = AtomicU64::new(0);
+static PF_SIGSEGV: AtomicU64 = AtomicU64::new(0);
+
+// ── Signal delivery counters ── indexed by signo (1-based)
+static SIGNAL_COUNTERS: [AtomicU64; SIGNAL_SLOTS] =
+    [const { AtomicU64::new(0) }; SIGNAL_SLOTS];
+
+// ── Syscall latency: per-syscall total_ns and invocation count (for avg) ──
+static LATENCY_TOTAL_NS: [AtomicU64; SYSCALL_STATS_SLOTS] =
+    [const { AtomicU64::new(0) }; SYSCALL_STATS_SLOTS];
+static LATENCY_COUNT: [AtomicU64; SYSCALL_STATS_SLOTS] =
+    [const { AtomicU64::new(0) }; SYSCALL_STATS_SLOTS];
+static LATENCY_MAX_NS: [AtomicU64; SYSCALL_STATS_SLOTS] =
+    [const { AtomicU64::new(0) }; SYSCALL_STATS_SLOTS];
+
 static TRACE_RING: Mutex<Vec<SyscallTraceEvent>> = Mutex::new(Vec::new());
 static DEEP_RING: Mutex<Vec<DeepTraceEvent>> = Mutex::new(Vec::new());
 static INFLIGHT: Mutex<Vec<SyscallInflight>> = Mutex::new(Vec::new());
@@ -149,6 +177,63 @@ pub fn record_raw_syscall(nr: u32) {
     COUNTERS[idx].fetch_add(1, Relaxed);
     SYSCALL_STATS_SHM.total.fetch_add(1, Relaxed);
     SYSCALL_STATS_SHM.last_sysno.store(nr, Relaxed);
+}
+
+/// Record a syscall error: increments per-syscall error counter + errno histogram.
+/// Called after `record_syscall_exit` when `retval < 0`.
+pub fn record_syscall_error(nr: u32, retval: isize) {
+    let idx = if nr >= SYSCALL_STATS_SLOTS as u32 {
+        OVERFLOW_IDX
+    } else {
+        nr as usize
+    };
+    ERROR_COUNTERS[idx].fetch_add(1, Relaxed);
+    TOTAL_ERRORS.fetch_add(1, Relaxed);
+    LAST_ERROR_NR.store(nr, Relaxed);
+    LAST_ERROR_RET.store(retval as i64, Relaxed);
+    // errno = -retval (Linux convention: retval = -errno on error)
+    let errno = (-retval) as usize;
+    if errno > 0 && errno < ERRNO_HISTOGRAM_SLOTS {
+        ERRNO_HISTOGRAM[errno].fetch_add(1, Relaxed);
+    }
+}
+
+/// Record page fault. `handled` = true if resolved, false if SIGSEGV sent.
+pub fn record_page_fault(handled: bool) {
+    PF_TOTAL.fetch_add(1, Relaxed);
+    if handled {
+        PF_HANDLED.fetch_add(1, Relaxed);
+    } else {
+        PF_SIGSEGV.fetch_add(1, Relaxed);
+    }
+}
+
+/// Record signal delivery. `signo` is 1-based (SIGSEGV=11, SIGBUS=7, etc.).
+pub fn record_signal_delivery(signo: u32) {
+    let idx = signo as usize;
+    if idx > 0 && idx < SIGNAL_SLOTS {
+        SIGNAL_COUNTERS[idx].fetch_add(1, Relaxed);
+    }
+}
+
+/// Record syscall latency (exit timestamp - enter timestamp).
+/// Called from `record_syscall_exit` when snapshot mode captured an enter_ts.
+pub fn record_syscall_latency(nr: u32, elapsed_ns: u64) {
+    let idx = if nr >= SYSCALL_STATS_SLOTS as u32 {
+        OVERFLOW_IDX
+    } else {
+        nr as usize
+    };
+    LATENCY_TOTAL_NS[idx].fetch_add(elapsed_ns, Relaxed);
+    LATENCY_COUNT[idx].fetch_add(1, Relaxed);
+    // Update max with CAS loop
+    let mut cur = LATENCY_MAX_NS[idx].load(Relaxed);
+    while elapsed_ns > cur {
+        match LATENCY_MAX_NS[idx].compare_exchange_weak(cur, elapsed_ns, Relaxed, Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 #[inline]
@@ -397,25 +482,39 @@ pub fn record_deep_event(category: &'static str, args: core::fmt::Arguments<'_>)
 }
 
 pub fn record_syscall_exit(nr: u32, retval: isize) {
+    // Record error if negative return
+    if retval < 0 {
+        record_syscall_error(nr, retval);
+    }
+
     if !snapshot_enabled() {
         return;
     }
 
+    let now_ns = monotonic_time_nanos();
     let task = current_task_ident();
-    let args = {
+    let (args, enter_ts_ns) = {
         if let Some(mut inflight) = INFLIGHT.try_lock() {
             inflight
                 .iter()
                 .position(|slot| slot.task.tid == task.tid)
-                .map(|pos| inflight.remove(pos).args)
-                .unwrap_or([0; 6])
+                .map(|pos| {
+                    let entry = inflight.remove(pos);
+                    (entry.args, Some(entry.enter_ts_ns))
+                })
+                .unwrap_or(([0; 6], None))
         } else {
-            [0; 6]
+            ([0; 6], None)
         }
     };
+    // Track latency even without snapshot (using inflight enter_ts from enter path)
+    if let Some(enter_ts) = enter_ts_ns {
+        let elapsed = now_ns.saturating_sub(enter_ts);
+        record_syscall_latency(nr, elapsed);
+    }
     let event = SyscallTraceEvent {
         seq: TRACE_SEQ.fetch_add(1, Relaxed).wrapping_add(1),
-        ts_ns: monotonic_time_nanos(),
+        ts_ns: now_ns,
         task,
         nr,
         args,
@@ -741,8 +840,32 @@ pub fn reset_stats() {
     for c in &COUNTERS {
         c.store(0, Relaxed);
     }
+    for c in &ERROR_COUNTERS {
+        c.store(0, Relaxed);
+    }
+    for c in &ERRNO_HISTOGRAM {
+        c.store(0, Relaxed);
+    }
+    for c in &SIGNAL_COUNTERS {
+        c.store(0, Relaxed);
+    }
+    for c in &LATENCY_TOTAL_NS {
+        c.store(0, Relaxed);
+    }
+    for c in &LATENCY_COUNT {
+        c.store(0, Relaxed);
+    }
+    for c in &LATENCY_MAX_NS {
+        c.store(0, Relaxed);
+    }
     SYSCALL_STATS_SHM.total.store(0, Relaxed);
     SYSCALL_STATS_SHM.last_sysno.store(0, Relaxed);
+    TOTAL_ERRORS.store(0, Relaxed);
+    LAST_ERROR_NR.store(0, Relaxed);
+    LAST_ERROR_RET.store(0, Relaxed);
+    PF_TOTAL.store(0, Relaxed);
+    PF_HANDLED.store(0, Relaxed);
+    PF_SIGSEGV.store(0, Relaxed);
 }
 
 pub fn format_stats_text() -> String {
@@ -760,4 +883,258 @@ pub fn format_stats_text() -> String {
 /// 仅一行十进制 total，供高频轮询（避免格式化整表）。
 pub fn format_stats_total_line() -> String {
     format!("{}\n", SYSCALL_STATS_SHM.total.load(Relaxed))
+}
+
+/// Format per-syscall error counts + errno histogram.
+pub fn format_error_stats_text() -> String {
+    let total_errors = TOTAL_ERRORS.load(Relaxed);
+    let last_nr = LAST_ERROR_NR.load(Relaxed);
+    let last_ret = LAST_ERROR_RET.load(Relaxed);
+    let mut body = format!("total_errors {total_errors}\nlast_error_nr {last_nr} last_error_ret {last_ret}\n");
+    // Per-syscall errors (only non-zero)
+    for i in 0..SYSCALL_STATS_SLOTS {
+        let c = ERROR_COUNTERS[i].load(Relaxed);
+        if c > 0 {
+            let _ = writeln!(body, "errors {i} {} {}", c, syscall_name(i as u32));
+        }
+    }
+    // Errno histogram (only non-zero)
+    body.push_str("errno_histogram\n");
+    for i in 1..ERRNO_HISTOGRAM_SLOTS {
+        let c = ERRNO_HISTOGRAM[i].load(Relaxed);
+        if c > 0 {
+            let name = linux_errno_name(i as i32);
+            let _ = writeln!(body, "  errno {i} ({name}) count {c}");
+        }
+    }
+    body
+}
+
+/// Format page fault statistics.
+pub fn format_page_fault_stats_text() -> String {
+    let total = PF_TOTAL.load(Relaxed);
+    let handled = PF_HANDLED.load(Relaxed);
+    let sigsegv = PF_SIGSEGV.load(Relaxed);
+    format!("total {total}\nhandled {handled}\nsigsegv {sigsegv}\n")
+}
+
+/// Format signal delivery statistics.
+pub fn format_signal_stats_text() -> String {
+    let mut body = String::new();
+    for i in 1..SIGNAL_SLOTS {
+        let c = SIGNAL_COUNTERS[i].load(Relaxed);
+        if c > 0 {
+            let name = signal_name(i as u32);
+            let _ = writeln!(body, "signal {i} ({name}) count {c}");
+        }
+    }
+    if body.is_empty() {
+        body.push_str("(no signals delivered)\n");
+    }
+    body
+}
+
+/// Format per-syscall latency summary (avg_ns, max_ns for non-zero entries).
+pub fn format_latency_stats_text() -> String {
+    let mut body = String::new();
+    for i in 0..SYSCALL_STATS_SLOTS {
+        let count = LATENCY_COUNT[i].load(Relaxed);
+        if count > 0 {
+            let total_ns = LATENCY_TOTAL_NS[i].load(Relaxed);
+            let max_ns = LATENCY_MAX_NS[i].load(Relaxed);
+            let avg_ns = total_ns / count;
+            let _ = writeln!(
+                body,
+                "latency {} {} avg_ns={avg_ns} max_ns={max_ns} total_ns={total_ns} {}",
+                i,
+                count,
+                syscall_name(i as u32),
+            );
+        }
+    }
+    if body.is_empty() {
+        body.push_str("(no latency data)\n");
+    }
+    body
+}
+
+/// Combined diagnostic summary — one-shot dump of all counters.
+pub fn format_diagnostic_summary() -> String {
+    let mut out = String::new();
+    let total = SYSCALL_STATS_SHM.total.load(Relaxed);
+    let total_errors = TOTAL_ERRORS.load(Relaxed);
+    let pf_total = PF_TOTAL.load(Relaxed);
+    let pf_handled = PF_HANDLED.load(Relaxed);
+    let pf_sigsegv = PF_SIGSEGV.load(Relaxed);
+    let _ = writeln!(out, "===DIAGNOSTIC_SUMMARY===");
+    let _ = writeln!(out, "syscalls_total {total}");
+    let _ = writeln!(out, "syscalls_errors {total_errors}");
+    let _ = writeln!(out, "page_faults_total {pf_total} handled {pf_handled} sigsegv {pf_sigsegv}");
+    // Top-10 syscalls by count
+    let mut top: Vec<(usize, u64)> = (0..SYSCALL_STATS_SLOTS)
+        .map(|i| (i, COUNTERS[i].load(Relaxed)))
+        .filter(|(_, c)| *c > 0)
+        .collect();
+    top.sort_by_key(|(_, c)| core::cmp::Reverse(*c));
+    out.push_str("top_syscalls");
+    for (nr, count) in top.iter().take(10) {
+        let _ = write!(out, " {}:{count}", syscall_name(*nr as u32));
+    }
+    out.push('\n');
+    // Top-10 syscalls by error count
+    let mut top_err: Vec<(usize, u64)> = (0..SYSCALL_STATS_SLOTS)
+        .map(|i| (i, ERROR_COUNTERS[i].load(Relaxed)))
+        .filter(|(_, c)| *c > 0)
+        .collect();
+    top_err.sort_by_key(|(_, c)| core::cmp::Reverse(*c));
+    if !top_err.is_empty() {
+        out.push_str("top_errors");
+        for (nr, count) in top_err.iter().take(10) {
+            let _ = write!(out, " {}:{count}", syscall_name(*nr as u32));
+        }
+        out.push('\n');
+    }
+    // Top-5 slowest syscalls by avg latency
+    let mut top_lat: Vec<(usize, u64, u64)> = (0..SYSCALL_STATS_SLOTS)
+        .filter_map(|i| {
+            let count = LATENCY_COUNT[i].load(Relaxed);
+            if count > 0 {
+                let total_ns = LATENCY_TOTAL_NS[i].load(Relaxed);
+                Some((i, total_ns / count, LATENCY_MAX_NS[i].load(Relaxed)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    top_lat.sort_by_key(|(_, avg, _)| core::cmp::Reverse(*avg));
+    if !top_lat.is_empty() {
+        out.push_str("slowest_syscalls");
+        for (nr, avg, max) in top_lat.iter().take(5) {
+            let _ = write!(out, " {}:avg={avg}ns/max={max}ns", syscall_name(*nr as u32));
+        }
+        out.push('\n');
+    }
+    // Top errno
+    let mut top_errno: Vec<(usize, u64)> = (1..ERRNO_HISTOGRAM_SLOTS)
+        .map(|i| (i, ERRNO_HISTOGRAM[i].load(Relaxed)))
+        .filter(|(_, c)| *c > 0)
+        .collect();
+    top_errno.sort_by_key(|(_, c)| core::cmp::Reverse(*c));
+    if !top_errno.is_empty() {
+        out.push_str("top_errno");
+        for (errno, count) in top_errno.iter().take(5) {
+            let name = linux_errno_name(*errno as i32);
+            let _ = write!(out, " {name}:{count}");
+        }
+        out.push('\n');
+    }
+    // Non-zero signals
+    let sigs: Vec<(usize, u64)> = (1..SIGNAL_SLOTS)
+        .map(|i| (i, SIGNAL_COUNTERS[i].load(Relaxed)))
+        .filter(|(_, c)| *c > 0)
+        .collect();
+    if !sigs.is_empty() {
+        out.push_str("signals");
+        for (signo, count) in &sigs {
+            let _ = write!(out, " {}:{count}", signal_name(*signo as u32));
+        }
+        out.push('\n');
+    }
+    out.push_str("===DIAGNOSTIC_SUMMARY_END===\n");
+    out
+}
+
+fn linux_errno_name(errno: i32) -> &'static str {
+    match errno {
+        1 => "EPERM",
+        2 => "ENOENT",
+        3 => "ESRCH",
+        4 => "EINTR",
+        5 => "EIO",
+        6 => "ENXIO",
+        7 => "E2BIG",
+        8 => "ENOEXEC",
+        9 => "EBADF",
+        10 => "ECHILD",
+        11 => "EAGAIN",
+        12 => "ENOMEM",
+        13 => "EACCES",
+        14 => "EFAULT",
+        16 => "EBUSY",
+        17 => "EEXIST",
+        18 => "EXDEV",
+        19 => "ENODEV",
+        20 => "ENOTDIR",
+        21 => "EISDIR",
+        22 => "EINVAL",
+        23 => "ENFILE",
+        24 => "EMFILE",
+        25 => "ENOTTY",
+        27 => "EFBIG",
+        28 => "ENOSPC",
+        29 => "ESPIPE",
+        30 => "EROFS",
+        31 => "EMLINK",
+        32 => "EPIPE",
+        33 => "EDOM",
+        34 => "ERANGE",
+        35 => "EDEADLK",
+        36 => "ENAMETOOLONG",
+        38 => "ENOSYS",
+        39 => "ENOTEMPTY",
+        40 => "ELOOP",
+        42 => "ENOMSG",
+        60 => "ENOSR",
+        61 => "ETIME",
+        62 => "ETIMEDOUT",
+        88 => "ENOTSOCK",
+        93 => "EPROTONOSUPPORT",
+        95 => "EOPNOTSUPP",
+        98 => "EADDRINUSE",
+        99 => "EADDRNOTAVAIL",
+        104 => "ECONNRESET",
+        105 => "EISCONN",
+        106 => "ENOTCONN",
+        110 => "ETIMEDOUT_CONN",
+        111 => "ECONNREFUSED",
+        112 => "EHOSTDOWN",
+        113 => "EHOSTUNREACH",
+        _ => "UNKNOWN",
+    }
+}
+
+fn signal_name(signo: u32) -> &'static str {
+    match signo {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGUSR1",
+        11 => "SIGSEGV",
+        12 => "SIGUSR2",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        16 => "SIGSTKFLT",
+        17 => "SIGCHLD",
+        18 => "SIGCONT",
+        19 => "SIGSTOP",
+        20 => "SIGTSTP",
+        21 => "SIGTTIN",
+        22 => "SIGTTOU",
+        23 => "SIGURG",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        26 => "SIGVTALRM",
+        27 => "SIGPROF",
+        28 => "SIGWINCH",
+        29 => "SIGIO",
+        31 => "SIGSYS",
+        _ => "SIG?",
+    }
 }

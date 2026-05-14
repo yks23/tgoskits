@@ -576,6 +576,26 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         SimpleFile::new_regular(fs.clone(), || Ok(stats::format_task_block_snapshot_text())),
     );
     root.add(
+        "syscall_error_stats",
+        SimpleFile::new_regular(fs.clone(), || Ok(stats::format_error_stats_text())),
+    );
+    root.add(
+        "syscall_latency_stats",
+        SimpleFile::new_regular(fs.clone(), || Ok(stats::format_latency_stats_text())),
+    );
+    root.add(
+        "page_fault_stats",
+        SimpleFile::new_regular(fs.clone(), || Ok(stats::format_page_fault_stats_text())),
+    );
+    root.add(
+        "signal_stats",
+        SimpleFile::new_regular(fs.clone(), || Ok(stats::format_signal_stats_text())),
+    );
+    root.add(
+        "diagnostic_summary",
+        SimpleFile::new_regular(fs.clone(), || Ok(stats::format_diagnostic_summary())),
+    );
+    root.add(
         "cpuinfo",
         SimpleFile::new_regular(fs.clone(), || Ok(format_cpuinfo())),
     );
