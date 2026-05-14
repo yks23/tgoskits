@@ -18,6 +18,9 @@ use crate::{
 
 /// Initialize and run initproc.
 pub fn init(args: &[String], envs: &[String]) {
+    // Initialize SMP TLB shootdown hart count for remote sfence.vma.
+    ax_hal::paging::set_smp_hart_count(ax_config::plat::MAX_CPU_NUM);
+
     pseudofs::mount_all().expect("Failed to mount pseudofs");
     spawn_alarm_task();
 

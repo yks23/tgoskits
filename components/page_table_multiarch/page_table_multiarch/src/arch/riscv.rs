@@ -2,13 +2,42 @@
 
 use ax_memory_addr::VirtAddr;
 use ax_page_table_entry::riscv::Rv64PTE;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{PageTable64, PageTable64Cursor, PagingMetaData};
+
+/// Number of SMP harts for TLB shootdown. Initialized to 1 (UP).
+static SMP_HART_COUNT: AtomicUsize = AtomicUsize::new(1);
 
 /// A virtual address that can be used in RISC-V Sv39 and Sv48 page tables.
 pub trait SvVirtAddr: ax_memory_addr::MemoryAddr + Send + Sync {
     /// Flush the TLB.
     fn flush_tlb(vaddr: Option<Self>);
+}
+
+/// Perform a remote TLB shootdown via SBI for SMP systems.
+#[cfg(not(docsrs))]
+#[inline]
+pub fn remote_flush_tlb(vaddr: Option<VirtAddr>) {
+    let n = SMP_HART_COUNT.load(Ordering::Relaxed);
+    if n <= 1 {
+        return;
+    }
+    let mut mask: usize = 0;
+    for i in 0..n {
+        mask |= 1 << (i % 64);
+    }
+    let hart_mask = sbi_rt::HartMask::from_mask_base(mask, 0);
+    if let Some(vaddr) = vaddr {
+        let _ = sbi_rt::remote_sfence_vma(hart_mask, vaddr.as_usize(), 4096);
+    } else {
+        let _ = sbi_rt::remote_sfence_vma(hart_mask, 0, 0);
+    }
+}
+
+/// Set the number of SMP harts for TLB shootdown. Call during boot.
+pub fn set_smp_hart_count(count: usize) {
+    SMP_HART_COUNT.store(count, Ordering::Relaxed);
 }
 
 impl SvVirtAddr for VirtAddr {
@@ -19,6 +48,8 @@ impl SvVirtAddr for VirtAddr {
         } else {
             riscv::asm::sfence_vma_all();
         }
+        #[cfg(not(docsrs))]
+        remote_flush_tlb(vaddr);
     }
 }
 

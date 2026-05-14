@@ -27,6 +27,7 @@ x86 = "0.52"
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64", doc, docsrs))'.dependencies]
 riscv = { version = "0.16", default-features = false }
+sbi-rt = { version = "0.0.3", features = ["legacy"] }
 
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]

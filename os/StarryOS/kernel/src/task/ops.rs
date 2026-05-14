@@ -198,39 +198,65 @@ fn handle_futex_death(entry: *mut RobustList, offset: i64) -> AxResult<()> {
 }
 
 pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
-    // Reference: https://elixir.bootlin.com/linux/v6.13.6/source/kernel/futex/core.c#L777
+    // Reference: Linux kernel/futex/core.c exit_robust_list()
+    // Walk the per-thread robust mutex list. On thread exit, mark each
+    // futex as owner-dead and wake waiters so they don't deadlock.
     //
     // Never dereference `head` as a kernel pointer: it is a user VMA address.
     // Compare walk termination against `&user_head->list` using byte offset only.
+    //
+    // Key difference from prior impl: we tolerate corrupt entries (skip them)
+    // rather than aborting, because aborting leaves subsequent futexes permanently
+    // locked — the exact cause of the vec_cache.rs:201 race in rustc.
 
     let mut limit = ROBUST_LIST_LIMIT;
 
     let head_addr = head.addr();
     let list_off = core::mem::offset_of!(RobustListHead, list);
-    let end_ptr = head_addr
-        .checked_add(list_off)
-        .ok_or(AxError::InvalidInput)? as *mut RobustList;
+    let Some(end_calc) = head_addr.checked_add(list_off) else {
+        return Err(AxError::InvalidInput);
+    };
+    let end_ptr = end_calc as *mut RobustList;
 
-    let head = head.vm_read()?;
+    let Ok(head) = head.vm_read() else {
+        return Err(AxError::BadAddress);
+    };
     let mut entry = head.list.next;
     let offset = head.futex_offset;
     let pending = head.list_op_pending;
 
     while !core::ptr::eq(entry, end_ptr) {
         if entry.is_null() {
-            return Err(AxError::BadAddress);
+            break;
         }
-        let next_entry = entry.vm_read()?.next;
+        let Ok(node) = entry.vm_read() else {
+            break;
+        };
+        let next_entry = node.next;
+        // Skip the pending entry in the main loop; handle it after (like Linux).
         if entry != pending {
-            handle_futex_death(entry, offset)?;
+            if let Err(e) = handle_futex_death(entry, offset) {
+                debug!("robust list: handle_futex_death {:?} failed: {:?}", entry, e);
+            }
         }
         entry = next_entry;
 
         limit -= 1;
         if limit == 0 {
-            return Err(AxError::FilesystemLoop);
+            break;
         }
         ax_task::yield_now();
+    }
+
+    // Handle the pending entry — the mutex being actively operated on at
+    // thread-death time. Linux processes it after the main loop.
+    if !pending.is_null()
+        && !core::ptr::eq(pending, end_ptr)
+        && !core::ptr::eq(pending, head_addr as *mut RobustList)
+    {
+        if let Err(e) = handle_futex_death(pending, offset) {
+            debug!("robust list: pending handle_futex_death {:?} failed: {:?}", pending, e);
+        }
     }
 
     Ok(())

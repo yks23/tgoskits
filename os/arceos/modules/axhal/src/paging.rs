@@ -5,6 +5,8 @@ use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr};
 use ax_page_table_multiarch::PagingHandler;
 #[doc(no_inline)]
 pub use ax_page_table_multiarch::{MappingFlags, PageSize, PagingError, PagingResult};
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub use ax_page_table_multiarch::riscv::set_smp_hart_count;
 
 use crate::mem::{phys_to_virt, virt_to_phys};
 
