@@ -106,8 +106,20 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// Number of CPUs that have completed initialization.
 static INITED_CPUS: AtomicUsize = AtomicUsize::new(0);
 
+/// Number of CPUs that actually booted (may be less than MAX_CPU_NUM when
+/// QEMU provides fewer harts than the compile-time config).
+#[cfg(feature = "smp")]
+static ACTUAL_BOOTED_CPUS: AtomicUsize = AtomicUsize::new(0);
+
 fn is_init_ok() -> bool {
-    INITED_CPUS.load(Ordering::Acquire) == ax_hal::cpu_num()
+    #[cfg(feature = "smp")]
+    {
+        INITED_CPUS.load(Ordering::Acquire) == ACTUAL_BOOTED_CPUS.load(Ordering::Acquire)
+    }
+    #[cfg(not(feature = "smp"))]
+    {
+        INITED_CPUS.load(Ordering::Acquire) == ax_hal::cpu_num()
+    }
 }
 
 /// The main entry point of the ArceOS runtime.

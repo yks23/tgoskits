@@ -20,6 +20,7 @@ use ax_config::plat::MAX_CPU_NUM;
 use ax_hal::mem::VirtAddr;
 #[cfg(not(feature = "plat-dyn"))]
 use ax_hal::mem::virt_to_phys;
+use ax_log::warn;
 
 #[cfg(not(feature = "plat-dyn"))]
 struct SecondaryBootStack {
@@ -99,7 +100,8 @@ fn prepare_secondary_boot_stack(slot: usize, cpu_id: usize) {
 pub fn start_secondary_cpus(primary_cpu_id: usize) {
     let mut slot = 0;
     let cpu_num = ax_hal::cpu_num();
-    for i in 0..cpu_num {
+    let mut actual_cpus = 1usize; // primary
+    'outer: for i in 0..cpu_num {
         if i != primary_cpu_id && slot < cpu_num - 1 {
             prepare_secondary_boot_stack(slot, i);
 
@@ -110,13 +112,32 @@ pub fn start_secondary_cpus(primary_cpu_id: usize) {
 
             debug!("starting CPU {i}...");
             ax_hal::power::cpu_boot(i, stack_top);
+            let expected = slot + 1;
             slot += 1;
 
-            while ENTERED_CPUS.load(Ordering::Acquire) <= slot {
+            // Spin-wait with timeout for this secondary to enter.
+            // Under QEMU -smp 1, non-existent harts will never enter.
+            let mut timed_out = false;
+            let mut spins = 0u64;
+            while ENTERED_CPUS.load(Ordering::Acquire) <= expected {
+                spins += 1;
+                if spins > 10_000_000 {
+                    warn!("CPU {i} failed to boot within timeout, skipping remaining");
+                    timed_out = true;
+                    break;
+                }
                 core::hint::spin_loop();
             }
+
+            if timed_out {
+                slot -= 1;
+                break 'outer;
+            }
+            actual_cpus += 1;
         }
     }
+    super::ACTUAL_BOOTED_CPUS.store(actual_cpus, Ordering::Release);
+    ax_hal::set_cpu_num(actual_cpus);
 }
 
 /// The main entry point of the ArceOS runtime for secondary cores.

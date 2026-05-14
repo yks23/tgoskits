@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{fence, Ordering};
 
 use ax_errno::{AxError, AxResult, LinuxError};
 use ax_hal::time::{TimeValue, monotonic_time, wall_time};
@@ -67,6 +67,7 @@ pub fn sys_futex(
     match command {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             // Fast path
+            fence(Ordering::SeqCst);
             if uaddr.vm_read()? != value {
                 stats::record_deep_event(
                     "futex",
@@ -105,10 +106,20 @@ pub fn sys_futex(
 
             match futex
                 .wq
-                .wait_if(bitset, timeout, || uaddr.vm_read() == Ok(value))
+                .wait_if(bitset, timeout, || {
+                    fence(Ordering::SeqCst);
+                    uaddr.vm_read() == Ok(value)
+                })
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    warn!(
+                        "futex wait_if cond_false addr={:#x} op={} expected={} actual={:?}",
+                        uaddr.addr(),
+                        futex_op,
+                        value,
+                        uaddr.vm_read()
+                    );
                     stats::record_deep_event(
                         "futex",
                         format_args!(

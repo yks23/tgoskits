@@ -407,6 +407,14 @@ unsafe extern "C" fn context_switch(_current_task: &mut TaskContext, _next_task:
         STR     s10, a0, 12
         STR     s11, a0, 13
 
+        // Clear any active LR/SC reservation from the previous task.
+        // Without this, a preempted LR/SC pair could succeed across a
+        // context switch, breaking user-space atomic operations (CAS).
+        .option push
+        .option arch, +a
+        sc.d    t0, zero, (sp)
+        .option pop
+
         // restore new context
         LDR     s11, a1, 13
         LDR     s10, a1, 12

@@ -121,45 +121,41 @@ pub fn init_early(cpu_id: usize, arg: usize) {
     ax_plat::init::init_early(cpu_id, arg);
 }
 
+/// Runtime CPU count. 0 = not yet set (fall back to platform value).
+#[cfg(feature = "smp")]
+static CPU_NUM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Gets the number of CPUs running in the system.
 ///
 /// When SMP is disabled, this function always returns 1.
 ///
-/// When SMP is enabled, it's the smaller one between the platform-declared CPU
-/// number [`ax_plat::power::cpu_num`] and the configured maximum CPU number
-/// `ax_config::plat::MAX_CPU_NUM`.
-///
-/// This value is determined during the BSP initialization phase.
+/// When SMP is enabled, returns the value set by [`set_cpu_num`], or the
+/// platform/CPU config value if not yet set.
 pub fn cpu_num() -> usize {
     #[cfg(feature = "smp")]
     {
-        use spin::Lazy;
+        use core::sync::atomic::Ordering;
 
-        /// The number of CPUs in the system. Based on the number declared by the
-        /// platform crate and limited by the configured maximum CPU number.
-        static CPU_NUM: Lazy<usize> = Lazy::new(|| {
-            let max_cpu_num = ax_config::plat::MAX_CPU_NUM;
-            let plat_cpu_num = ax_plat::power::cpu_num();
-            let cpu_num = plat_cpu_num.min(max_cpu_num);
-
-            info!("CPU number: max = {max_cpu_num}, platform = {plat_cpu_num}, use = {cpu_num}");
-
-            if plat_cpu_num > max_cpu_num {
-                warn!(
-                    "platform declares more CPUs ({plat_cpu_num}) than configured max \
-                     ({max_cpu_num}), only the first {max_cpu_num} CPUs will be used."
-                );
-            }
-
-            cpu_num
-        });
-
-        *CPU_NUM
+        let n = CPU_NUM.load(Ordering::Acquire);
+        if n > 0 {
+            n
+        } else {
+            ax_plat::power::cpu_num().min(ax_config::plat::MAX_CPU_NUM)
+        }
     }
     #[cfg(not(feature = "smp"))]
     {
         1
     }
+}
+
+/// Update the runtime CPU count (e.g., after detecting fewer booted harts
+/// than the compile-time MAX_CPU_NUM when QEMU provides fewer vCPUs).
+#[cfg(feature = "smp")]
+pub fn set_cpu_num(n: usize) {
+    use core::sync::atomic::Ordering;
+
+    CPU_NUM.store(n, Ordering::Release);
 }
 
 #[allow(unused_macros)]

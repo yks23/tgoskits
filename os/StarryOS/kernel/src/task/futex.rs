@@ -202,8 +202,17 @@ impl FutexKey {
     }
 
     /// Shortcut to create a `FutexKey` for the current task's address space.
+    ///
+    /// Uses `try_lock` to avoid deadlocking if the aspace is already held
+    /// (e.g., signal delivery during sys_mmap). Falls back to `Private`
+    /// when the lock cannot be acquired.
     pub fn new_current(address: usize) -> Self {
-        Self::new(&current().as_thread().proc_data.aspace.lock(), address)
+        let curr = current();
+        let aspace = &curr.as_thread().proc_data.aspace;
+        match aspace.try_lock() {
+            Some(guard) => Self::new(&guard, address),
+            None => Self::Private { address },
+        }
     }
 
     fn as_usize(&self) -> usize {

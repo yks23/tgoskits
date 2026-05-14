@@ -122,8 +122,12 @@ fn select_run_queue_index(cpumask: AxCpuMask) -> usize {
     assert!(!cpumask.is_empty(), "No available CPU for task execution");
 
     // Round-robin selection of the run queue index.
+    // Use runtime cpu_num() instead of compile-time MAX_CPU_NUM so that
+    // tasks are only distributed across actually-booted CPUs (e.g., when
+    // QEMU provides fewer harts than MAX_CPU_NUM).
+    let cpu_num = ax_hal::cpu_num();
     loop {
-        let index = RUN_QUEUE_INDEX.fetch_add(1, Ordering::SeqCst) % ax_config::plat::MAX_CPU_NUM;
+        let index = RUN_QUEUE_INDEX.fetch_add(1, Ordering::SeqCst) % cpu_num;
         if cpumask.get(index) {
             return index;
         }

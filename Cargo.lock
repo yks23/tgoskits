@@ -1172,6 +1172,7 @@ dependencies = [
  "log",
  "rand 0.10.1",
  "riscv 0.16.0",
+ "sbi-rt",
  "x86",
 ]
 
