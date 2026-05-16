@@ -175,7 +175,7 @@ impl<B: BlockDevice> Jbd2Dev<B> {
         let updates = Jbd2Update(block_id, new_buf);
 
         let Some(system) = self.system.as_mut() else {
-            error!(
+            trace!(
                 "journal is enabled but JBD2 state is not initialized; writing block {block_id} \
                  directly"
             );
@@ -226,7 +226,7 @@ impl<B: BlockDevice> Jbd2Dev<B> {
         }
 
         let Some(system) = self.system.as_mut() else {
-            error!(
+            trace!(
                 "journal is enabled but JBD2 state is not initialized; writing {count} block(s) \
                  starting at {block_id} directly"
             );
