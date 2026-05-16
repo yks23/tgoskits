@@ -195,7 +195,7 @@ pub fn get_file_inode<B: BlockDevice>(
                         current_inode.i_generation,
                         block_data,
                     ) {
-                        error!(
+                        debug!(
                             "dir block checksum mismatch: ino={} blk_idx={} phys={}",
                             current_ino_num, idx, phys.1
                         );

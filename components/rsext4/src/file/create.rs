@@ -1,3 +1,5 @@
+use log::trace;
+
 use super::*;
 
 fn discard_unpublished_inode_blocks<B: BlockDevice>(
@@ -175,6 +177,7 @@ pub fn mkfile<B: BlockDevice>(
     initial_data: Option<&[u8]>,
     file_type: Option<u8>,
 ) -> Ext4Result<Ext4Inode> {
+    trace!("rsext4_mkfile stage=enter path={path}");
     // Normalize first so all later path splitting uses one canonical form.
     let norm_path = split_paren_child_and_tranlatevalid(path);
     if norm_path.is_empty() || norm_path == "/" {
@@ -182,6 +185,7 @@ pub fn mkfile<B: BlockDevice>(
     }
 
     // Refuse to overwrite an existing entry.
+    trace!("rsext4_mkfile stage=lookup_existing path={path} norm={norm_path}");
     if get_file_inode(fs, device, &norm_path)?.is_some() {
         return Err(Ext4Error::already_exists());
     }
@@ -203,14 +207,17 @@ pub fn mkfile<B: BlockDevice>(
     };
 
     // Create missing parent directories before allocating the file inode.
+    trace!("rsext4_mkfile stage=ensure_parent path={path} parent={parent}");
     ensure_directory(device, fs, &parent)?;
 
     // Reload the parent inode after directory creation so we use the final
     // parent metadata and inode number.
+    trace!("rsext4_mkfile stage=get_parent path={path} parent={parent}");
     let (parent_ino_num, parent_inode) =
         get_inode_with_num(fs, device, &parent)?.ok_or(Ext4Error::not_found())?;
 
     // Allocate the inode before writing any initial data blocks.
+    trace!("rsext4_mkfile stage=alloc_inode path={path}");
     let new_file_ino = fs.alloc_inode(device)?;
 
     // Materialize the initial file payload block by block.
@@ -335,6 +342,7 @@ pub fn mkfile<B: BlockDevice>(
         create_update.projid = Some(parent_inode.i_projid);
     }
 
+    trace!("rsext4_mkfile stage=finalize_inode path={path} ino={new_file_ino}");
     fs.finalize_inode_update(device, new_file_ino, &mut new_inode, create_update)?;
 
     // Finally publish the file by linking it into the parent directory.
@@ -344,6 +352,10 @@ pub fn mkfile<B: BlockDevice>(
     };
 
     let mut parent_inode_copy = parent_inode;
+    trace!(
+        "rsext4_mkfile stage=insert_dir_entry path={path} parent_ino={parent_ino_num} \
+         child={child}"
+    );
     if insert_dir_entry(
         fs,
         device,
@@ -362,5 +374,8 @@ pub fn mkfile<B: BlockDevice>(
         return Err(Ext4Error::corrupted());
     }
 
-    fs.get_inode_by_num(device, new_file_ino)
+    trace!("rsext4_mkfile stage=get_new_inode path={path} ino={new_file_ino}");
+    let inode = fs.get_inode_by_num(device, new_file_ino);
+    trace!("rsext4_mkfile stage=done path={path} ino={new_file_ino}");
+    inode
 }
