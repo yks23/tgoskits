@@ -138,6 +138,9 @@ impl Ext4FileSystem {
             return Ok(Vec::new());
         }
 
+        // Pre-collect per-group metadata to avoid borrowing self.group_descs
+        // across mutable borrows of self later in the loop body.
+        let mut group_meta: Vec<(BGIndex, u32, AbsoluteBN, bool, Ext4GroupDesc)> = Vec::new();
         for (idx, desc) in self.group_descs.iter().enumerate() {
             let group_idx =
                 BGIndex::new(u32::try_from(idx).map_err(|_| Ext4Error::from(Errno::EOVERFLOW))?);
@@ -145,14 +148,21 @@ impl Ext4FileSystem {
             if free < count {
                 continue;
             }
+            group_meta.push((
+                group_idx,
+                free,
+                AbsoluteBN::new(desc.inode_bitmap()),
+                desc.is_inode_bitmap_uninit(),
+                *desc,
+            ));
+        }
 
-            let bitmap_block = AbsoluteBN::new(desc.inode_bitmap());
+        for (group_idx, _free, bitmap_block, inode_uninit, desc) in group_meta {
             let cache_key = CacheKey::new_inode(group_idx);
             let mut inodes: Vec<InodeNumber> = Vec::with_capacity(count as usize);
             let mut alloc_error: Option<Ext4Error> = None;
 
-            if ext4_superblock_has_metadata_csum(&self.superblock) && !desc.is_inode_bitmap_uninit()
-            {
+            if ext4_superblock_has_metadata_csum(&self.superblock) && !inode_uninit {
                 let bm = self
                     .bitmap_cache
                     .get_or_load(block_dev, cache_key, bitmap_block)?;
@@ -167,10 +177,15 @@ impl Ext4FileSystem {
             // only mutable copy while we flip bits.
             self.bitmap_cache
                 .modify(block_dev, cache_key, bitmap_block, |data| {
+                    // When EXT4_BG_INODE_UNINIT is set the on-disk bitmap is
+                    // stale. Linux synthesizes an all-free bitmap in memory.
+                    if inode_uninit {
+                        data.fill(0);
+                    }
                     for _ in 0..count {
                         match self
                             .inode_allocator
-                            .alloc_inode_in_group(data, group_idx, desc)
+                            .alloc_inode_in_group(data, group_idx, &desc)
                         {
                             Ok(InodeAlloc { global_inode, .. }) => inodes.push(global_inode),
                             Err(err) if err.code == Errno::ENOSPC => break,
@@ -201,7 +216,9 @@ impl Ext4FileSystem {
             }
 
             if inodes.len() as u32 != count {
-                return Err(Ext4Error::no_space());
+                // This group couldn't satisfy the full request; try the
+                // next group instead of failing immediately.
+                continue;
             }
 
             let ipg = self.superblock.s_inodes_per_group;
