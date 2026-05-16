@@ -157,12 +157,24 @@ pub fn sys_ppoll(
     sigsetsize: usize,
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
-    let fds = fds.get_as_mut_slice(nfds.try_into().map_err(|_| AxError::InvalidInput)?)?;
+    let nfds = nfds.try_into().map_err(|_| AxError::InvalidInput)?;
+    let fds_addr = fds.address().as_usize();
+    let mut fds_buf = UserConstPtr::<pollfd>::from(fds_addr).get_as_slice(nfds)?.to_vec();
     let timeout = nullable!(timeout.get_as_ref())?
         .map(|ts| ts.try_into_time_value())
         .transpose()?;
     // Signal mask is passed through to do_poll -> with_blocked_signals, and
     // poll_io uses the interruptible wrapper so EINTR is correctly returned
     // when a signal arrives during blocking.
-    do_poll(fds, timeout, nullable!(sigmask.get_as_ref())?.copied())
+    let result = do_poll(
+        &mut fds_buf,
+        timeout,
+        nullable!(sigmask.get_as_ref())?.copied(),
+    );
+    if result.is_ok() {
+        UserPtr::<pollfd>::from(fds_addr)
+            .get_as_mut_slice(nfds)?
+            .copy_from_slice(&fds_buf);
+    }
+    result
 }
