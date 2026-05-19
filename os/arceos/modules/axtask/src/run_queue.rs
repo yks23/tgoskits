@@ -7,11 +7,12 @@ use ax_hal::percpu::this_cpu_id;
 use ax_kernel_guard::BaseGuard;
 use ax_kspin::{SpinNoIrqGuard, SpinRaw};
 use ax_lazyinit::LazyInit;
+use ax_memory_addr::VirtAddr;
 use ax_sched::BaseScheduler;
 
 use crate::{
     AxCpuMask, AxTaskRef, Scheduler, TaskInner, WaitQueue,
-    task::{CurrentTask, TaskState},
+    task::{CurrentTask, TASK_STACK_ALIGN, TaskStack, TaskState},
     wait_queue::WaitQueueGuard,
 };
 
@@ -51,6 +52,17 @@ static mut RUN_QUEUES: [MaybeUninit<&'static mut AxRunQueue>; ax_config::plat::M
     [ARRAY_REPEAT_VALUE; ax_config::plat::MAX_CPU_NUM];
 #[allow(clippy::declare_interior_mutable_const)] // It's ok because it's used only for initialization `RUN_QUEUES`.
 const ARRAY_REPEAT_VALUE: MaybeUninit<&'static mut AxRunQueue> = MaybeUninit::uninit();
+
+#[cfg(target_os = "none")]
+fn main_task_stack() -> TaskStack {
+    let (stack_ptr, stack_size) = ax_hal::mem::boot_stack_bounds(this_cpu_id());
+    TaskStack::borrowed(stack_ptr, stack_size, TASK_STACK_ALIGN)
+}
+
+#[cfg(not(target_os = "none"))]
+fn main_task_stack() -> TaskStack {
+    TaskStack::alloc(ax_config::TASK_STACK_SIZE)
+}
 
 /// Returns a reference to the current run queue in [`CurrentRunQueueRef`].
 ///
@@ -556,6 +568,8 @@ impl AxRunQueue {
             prev_task.id_name(),
             next_task.id_name()
         );
+        #[cfg(feature = "stack-canary")]
+        prev_task.check_stack_canary();
         #[cfg(feature = "preempt")]
         next_task.set_preempt_pending(false);
         next_task.set_state(TaskState::Running);
@@ -674,8 +688,10 @@ pub(crate) fn init() {
 
     // Create the `idle` task (not current task).
     // The idle task will run when there is no other runnable task.
-    // Stack size of idle task should be large because traps/interrupts may happen in idle task,
-    // which need more stack space.
+    #[cfg(feature = "lockdep")]
+    const IDLE_TASK_STACK_SIZE: usize = ax_config::TASK_STACK_SIZE;
+    // TODO: Consider unifying the non-lockdep idle stack size with the task stack configuration.
+    #[cfg(not(feature = "lockdep"))]
     const IDLE_TASK_STACK_SIZE: usize = 16384;
     let idle_task = TaskInner::new(|| crate::run_idle(), "idle".into(), IDLE_TASK_STACK_SIZE);
     // idle task should be pinned to the current CPU.
@@ -685,7 +701,7 @@ pub(crate) fn init() {
     });
 
     // Put the subsequent execution into the `main` task.
-    let main_task = TaskInner::new_init("main".into()).into_arc();
+    let main_task = TaskInner::new_init("main".into(), main_task_stack()).into_arc();
     main_task.set_state(TaskState::Running);
     unsafe { CurrentTask::init_current(main_task) }
 
@@ -697,11 +713,15 @@ pub(crate) fn init() {
     }
 }
 
-pub(crate) fn init_secondary() {
+pub(crate) fn init_secondary(stack_ptr: VirtAddr, stack_size: usize) {
     let cpu_id = this_cpu_id();
 
     // Put the subsequent execution into the `idle` task.
-    let idle_task = TaskInner::new_init("idle".into()).into_arc();
+    let idle_task = TaskInner::new_init(
+        "idle".into(),
+        TaskStack::borrowed(stack_ptr, stack_size, TASK_STACK_ALIGN),
+    )
+    .into_arc();
     idle_task.set_state(TaskState::Running);
     IDLE_TASK.with_current(|i| {
         i.init_once(idle_task.clone());

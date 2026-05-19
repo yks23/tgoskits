@@ -20,12 +20,12 @@ pub use {
 #[cfg(feature = "input")]
 pub use {
     crate::structs::AxInputDevice,
-    ax_driver_input::{Event, EventType, InputDeviceId, InputDriverOps},
+    ax_driver_input::{AbsInfo, Event, EventType, InputDeviceId, InputDriverOps},
 };
 #[cfg(feature = "net")]
 pub use {
     crate::structs::AxNetDevice,
-    ax_driver_net::{NetBufPtr, NetDriverOps},
+    ax_driver_net::{NetBufPtr, NetDriverOps, NetIrqEvent},
 };
 #[cfg(feature = "vsock")]
 pub use {

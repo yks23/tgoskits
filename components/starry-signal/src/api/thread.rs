@@ -13,13 +13,29 @@ use starry_vm::{VmMutPtr, VmPtr};
 use super::ProcessSignalManager;
 use crate::{
     DefaultSignalAction, PendingSignals, SignalAction, SignalActionFlags, SignalDisposition,
-    SignalInfo, SignalOSAction, SignalSet, SignalStack, Signo, api::SignalActions, arch::UContext,
+    SignalInfo, SignalOSAction, SignalSet, SignalStack, Signo, arch::UContext,
 };
 
 struct SignalFrame {
     ucontext: UContext,
     siginfo: SignalInfo,
     uctx: UserContext,
+}
+
+enum PreparedSignal {
+    Ignore,
+    Action(SignalOSAction),
+    Handler(PreparedSignalHandler),
+}
+
+struct PreparedSignalHandler {
+    signo: Signo,
+    siginfo: SignalInfo,
+    restore_blocked: SignalSet,
+    handler: usize,
+    restorer: usize,
+    add_blocked: SignalSet,
+    use_sigaltstack: bool,
 }
 
 /// Thread-level signal manager.
@@ -35,6 +51,15 @@ pub struct ThreadSignalManager {
     stack: SpinNoIrq<SignalStack>,
 
     possibly_has_signal: AtomicBool,
+
+    /// The set of signals this thread is currently waiting for via
+    /// `rt_sigtimedwait`/`sigwaitinfo`, or `None` if not in a sigwait call.
+    ///
+    /// `ProcessSignalManager::send_signal` checks this to avoid dropping
+    /// a signal via `is_ignore()` when a thread is specifically waiting for it.
+    /// Using the actual wait set (instead of a bare boolean) avoids queuing
+    /// unrelated signals that happen to be default-ignore.
+    pub sigwait_set: SpinNoIrq<Option<SignalSet>>,
 }
 
 impl ThreadSignalManager {
@@ -47,6 +72,7 @@ impl ThreadSignalManager {
             stack: SpinNoIrq::new(SignalStack::default()),
 
             possibly_has_signal: AtomicBool::new(false),
+            sigwait_set: SpinNoIrq::new(None),
         });
         proc.children.lock().push((tid, Arc::downgrade(&this)));
         this
@@ -65,90 +91,126 @@ impl ThreadSignalManager {
         &self.proc
     }
 
-    pub fn handle_signal(
+    fn prepare_signal(
         &self,
-        uctx: &mut UserContext,
         restore_blocked: SignalSet,
         sig: &SignalInfo,
-        action: &SignalAction,
-        actions: &mut SignalActions,
-    ) -> Option<SignalOSAction> {
+    ) -> (bool, PreparedSignal) {
         let signo = sig.signo();
         debug!("Handle signal: {signo:?}");
+        let action = {
+            let mut actions = self.proc.actions.lock();
+            let action = actions[signo].clone();
+            if action.flags.contains(SignalActionFlags::RESETHAND) {
+                actions[signo] = SignalAction::default();
+            }
+            action
+        };
+        let restartable = action.is_restartable();
+
         match action.disposition {
-            SignalDisposition::Default => match signo.default_action() {
-                DefaultSignalAction::Terminate => Some(SignalOSAction::Terminate),
-                DefaultSignalAction::CoreDump => Some(SignalOSAction::CoreDump),
-                DefaultSignalAction::Stop => Some(SignalOSAction::Stop),
-                DefaultSignalAction::Ignore => None,
-                DefaultSignalAction::Continue => Some(SignalOSAction::Continue),
-            },
-            SignalDisposition::Ignore => None,
+            SignalDisposition::Default => (
+                restartable,
+                match signo.default_action() {
+                    DefaultSignalAction::Terminate => {
+                        PreparedSignal::Action(SignalOSAction::Terminate)
+                    }
+                    DefaultSignalAction::CoreDump => {
+                        PreparedSignal::Action(SignalOSAction::CoreDump)
+                    }
+                    DefaultSignalAction::Stop => PreparedSignal::Action(SignalOSAction::Stop),
+                    DefaultSignalAction::Ignore => PreparedSignal::Ignore,
+                    DefaultSignalAction::Continue => {
+                        PreparedSignal::Action(SignalOSAction::Continue)
+                    }
+                },
+            ),
+            SignalDisposition::Ignore => (restartable, PreparedSignal::Ignore),
             SignalDisposition::Handler(handler) => {
-                let layout = Layout::new::<SignalFrame>();
-                let stack = self.stack.lock();
-                let sp = if stack.disabled() || !action.flags.contains(SignalActionFlags::ONSTACK) {
-                    uctx.sp()
-                } else {
-                    stack.sp + stack.size
-                };
-                drop(stack);
-
-                let aligned_sp = (sp - layout.size()) & !(layout.align() - 1);
-
-                let frame_ptr = aligned_sp as *mut SignalFrame;
-                if frame_ptr
-                    .vm_write(SignalFrame {
-                        ucontext: UContext::new(uctx, restore_blocked),
-                        siginfo: sig.clone(),
-                        uctx: *uctx,
-                    })
-                    .is_err()
-                {
-                    return Some(SignalOSAction::CoreDump);
-                }
-
-                uctx.set_ip(handler as usize);
-                uctx.set_sp(aligned_sp);
-                uctx.set_arg0(signo as _);
-                uctx.set_arg1(aligned_sp + offset_of!(SignalFrame, siginfo));
-                uctx.set_arg2(aligned_sp + offset_of!(SignalFrame, ucontext));
-
                 let restorer = action
                     .restorer
                     .map_or(self.proc.default_restorer, |f| f as _);
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let new_sp = uctx.sp() - 8;
-                    if (new_sp as *mut usize).vm_write(restorer).is_err() {
-                        return Some(SignalOSAction::CoreDump);
-                    }
-                    uctx.set_sp(new_sp);
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                uctx.set_ra(restorer);
-
                 let mut add_blocked = action.mask;
                 if !action.flags.contains(SignalActionFlags::NODEFER) {
                     add_blocked.add(signo);
                 }
 
-                if action.flags.contains(SignalActionFlags::RESETHAND) {
-                    actions[signo] = SignalAction::default();
-                }
-                *self.blocked.lock() |= add_blocked;
-                Some(SignalOSAction::Handler)
+                (
+                    restartable,
+                    PreparedSignal::Handler(PreparedSignalHandler {
+                        signo,
+                        siginfo: sig.clone(),
+                        restore_blocked,
+                        handler: handler as usize,
+                        restorer,
+                        add_blocked,
+                        use_sigaltstack: action.flags.contains(SignalActionFlags::ONSTACK),
+                    }),
+                )
             }
         }
     }
 
+    fn install_signal_handler(
+        &self,
+        uctx: &mut UserContext,
+        prepared: PreparedSignalHandler,
+    ) -> SignalOSAction {
+        let layout = Layout::new::<SignalFrame>();
+        let sp = if prepared.use_sigaltstack {
+            let stack = self.stack.lock();
+            if stack.disabled() {
+                uctx.sp()
+            } else {
+                stack.sp + stack.size
+            }
+        } else {
+            uctx.sp()
+        };
+        let aligned_sp = (sp - layout.size()) & !(layout.align() - 1);
+        let frame_ptr = aligned_sp as *mut SignalFrame;
+        if frame_ptr
+            .vm_write(SignalFrame {
+                ucontext: UContext::new(uctx, prepared.restore_blocked),
+                siginfo: prepared.siginfo,
+                uctx: *uctx,
+            })
+            .is_err()
+        {
+            return SignalOSAction::CoreDump;
+        }
+
+        uctx.set_ip(prepared.handler);
+        uctx.set_sp(aligned_sp);
+        uctx.set_arg0(prepared.signo as _);
+        uctx.set_arg1(aligned_sp + offset_of!(SignalFrame, siginfo));
+        uctx.set_arg2(aligned_sp + offset_of!(SignalFrame, ucontext));
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let new_sp = uctx.sp() - 8;
+            if (new_sp as *mut usize).vm_write(prepared.restorer).is_err() {
+                return SignalOSAction::CoreDump;
+            }
+            uctx.set_sp(new_sp);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        uctx.set_ra(prepared.restorer);
+
+        *self.blocked.lock() |= prepared.add_blocked;
+        SignalOSAction::NoFurtherAction
+    }
+
     #[cold]
-    fn check_signals_slow(
+    fn check_signals_slow_with<F>(
         &self,
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
-        actions: &mut SignalActions,
-    ) -> Option<(SignalInfo, SignalOSAction)> {
+        before_deliver: &mut F,
+    ) -> Option<(SignalInfo, SignalOSAction)>
+    where
+        F: FnMut(&mut UserContext, &SignalInfo, bool),
+    {
         let blocked = self.blocked.lock();
         let mask = !*blocked;
         let restore_blocked = restore_blocked.unwrap_or_else(|| *blocked);
@@ -162,34 +224,54 @@ impl ThreadSignalManager {
                     self.proc.dequeue_signal(&mask)
                 }
             }?;
-            let action = actions[sig.signo()].clone();
-
-            if let Some(os_action) =
-                self.handle_signal(uctx, restore_blocked, &sig, &action, actions)
-            {
-                break Some((sig, os_action));
+            let (restartable, prepared) = self.prepare_signal(restore_blocked, &sig);
+            match prepared {
+                PreparedSignal::Ignore => continue,
+                PreparedSignal::Action(os_action) => {
+                    before_deliver(uctx, &sig, restartable);
+                    break Some((sig, os_action));
+                }
+                PreparedSignal::Handler(prepared) => {
+                    before_deliver(uctx, &sig, restartable);
+                    let os_action = self.install_signal_handler(uctx, prepared);
+                    break Some((sig, os_action));
+                }
             }
         }
     }
 
-    /// Checks pending signals and handle them.
+    /// Checks pending signals and delivers one if possible.
     ///
-    /// Returns the signal number and the action the OS should take, if any.
-    pub fn check_signals(
+    /// Calls `before_deliver` immediately before the selected signal is
+    /// delivered. The callback receives the user context, the delivered signal,
+    /// and whether its disposition is restartable.
+    pub fn check_signals_with<F>(
         &self,
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
-    ) -> Option<(SignalInfo, SignalOSAction)> {
-        // Lock by `actions`
-        let mut actions = self.proc.actions.lock();
-
+        mut before_deliver: F,
+    ) -> Option<(SignalInfo, SignalOSAction)>
+    where
+        F: FnMut(&mut UserContext, &SignalInfo, bool),
+    {
         // Fast path
         if !self.possibly_has_signal.load(Ordering::Acquire)
             && !self.proc.possibly_has_signal.load(Ordering::Acquire)
         {
             return None;
         }
-        self.check_signals_slow(uctx, restore_blocked, &mut actions)
+        self.check_signals_slow_with(uctx, restore_blocked, &mut before_deliver)
+    }
+
+    /// Checks pending signals and delivers one if possible.
+    ///
+    /// Returns the delivered signal and its delivery result, if any.
+    pub fn check_signals(
+        &self,
+        uctx: &mut UserContext,
+        restore_blocked: Option<SignalSet>,
+    ) -> Option<(SignalInfo, SignalOSAction)> {
+        self.check_signals_with(uctx, restore_blocked, |_, _, _| {})
     }
 
     /// Restores the signal frame. Called by `sigreturn`.
@@ -219,7 +301,17 @@ impl ThreadSignalManager {
         // Lock by `actions`
         let actions = self.proc.actions.lock();
         debug!("signal: {signo:?}");
-        if actions[signo].is_ignore(signo) {
+
+        // Skip is_ignore() when the signal is blocked in this thread OR when
+        // this thread is inside rt_sigtimedwait/sigwaitinfo waiting for it.
+        // POSIX requires that a blocked signal is queued as pending even if
+        // its default disposition is to ignore it, so that sigtimedwait() can
+        // synchronously consume it.  tgkill/tkill target a specific thread, so
+        // we must apply the same exemption here as ProcessSignalManager does
+        // for the process-level path.
+        let blocked = self.signal_blocked(signo);
+        let in_sigwait = self.sigwait_set.lock().is_some_and(|s| s.has(signo));
+        if !blocked && !in_sigwait && actions[signo].is_ignore(signo) {
             return false;
         }
 

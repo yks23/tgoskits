@@ -41,6 +41,9 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     }
 }
 
+#[cfg(all(feature = "multitask", feature = "lockdep"))]
+mod lockdep;
+
 #[cfg(feature = "multitask")]
 mod mutex;
 
@@ -50,4 +53,4 @@ pub use ax_kspin::{SpinNoIrq as Mutex, SpinNoIrqGuard as MutexGuard};
 
 #[cfg(feature = "multitask")]
 #[cfg_attr(doc, doc(cfg(feature = "multitask")))]
-pub use self::mutex::{Mutex, MutexGuard, RawMutex};
+pub use self::mutex::{LockSubclass, LockdepMutexExt, Mutex, MutexGuard, RawMutex};

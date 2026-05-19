@@ -73,11 +73,14 @@ pub mod irq;
 #[cfg(feature = "paging")]
 pub mod paging;
 
+#[cfg(feature = "starry-kcov")]
+pub mod kcov;
+
 /// Console input and output.
 pub mod console {
     #[cfg(feature = "irq")]
-    pub use ax_plat::console::irq_num;
-    pub use ax_plat::console::{read_bytes, write_bytes};
+    pub use ax_plat::console::{ConsoleIrqEvent, handle_irq, irq_num, set_input_irq_enabled};
+    pub use ax_plat::console::{read_bytes, write_bytes, write_text_bytes};
 }
 
 /// CPU power management.
@@ -91,7 +94,10 @@ pub mod power {
 pub mod trap {
     #[cfg(target_arch = "x86_64")]
     pub use ax_cpu::trap::debug_handler;
-    pub use ax_cpu::trap::{PageFaultFlags, breakpoint_handler, irq_handler, page_fault_handler};
+    pub use ax_cpu::trap::{
+        PageFaultFlags, breakpoint_handler, dispatch_irq, dispatch_page_fault, irq_handler,
+        page_fault_handler, set_irq_handler, set_page_fault_handler,
+    };
 }
 
 /// CPU register states for context switching.

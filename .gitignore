@@ -47,8 +47,14 @@ __pycache__/
 *.img
 !.claude/skills/*
 /tmp/*
+*.vi
 
 .arceos*
 .starry*
 .axvisor*
 .board*
+.codex
+.agents
+.image.toml
+os/StarryOS-REF
+.Ds_Store

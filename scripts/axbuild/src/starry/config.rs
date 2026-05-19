@@ -3,6 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::anyhow;
+
 use super::{
     board::{self, Board},
     build,
@@ -49,10 +51,15 @@ fn write_board_to_build_config(build_config_path: &Path, board: &Board) -> anyho
     Ok(())
 }
 
-fn update_snapshot_for_board(workspace_root: &Path, board: &Board) -> anyhow::Result<()> {
+fn update_snapshot_for_board(
+    workspace_root: &Path,
+    board: &Board,
+    build_config_path: &Path,
+) -> anyhow::Result<()> {
     let mut snapshot = StarryCommandSnapshot::load(workspace_root)?;
     snapshot.arch = Some(starry_arch_for_target_checked(&board.target)?.to_string());
     snapshot.target = Some(board.target.clone());
+    snapshot.config = Some(snapshot_path_value(workspace_root, build_config_path));
     snapshot.qemu.qemu_config = snapshot
         .qemu
         .qemu_config
@@ -86,14 +93,14 @@ pub(crate) fn ensure_default_build_config_for_target(
         )
     })?;
     write_board_to_build_config(build_config_path, &board)?;
-    update_snapshot_for_board(workspace_root, &board)?;
+    update_snapshot_for_board(workspace_root, &board, build_config_path)?;
     Ok(Some(board))
 }
 
 pub(crate) fn write_defconfig(workspace_root: &Path, board_name: &str) -> anyhow::Result<PathBuf> {
     let board = resolve_board(workspace_root, board_name)?;
     let build_config_path = write_board_to_default_build_config(workspace_root, &board)?;
-    update_snapshot_for_board(workspace_root, &board)?;
+    update_snapshot_for_board(workspace_root, &board, &build_config_path)?;
     Ok(build_config_path)
 }
 
@@ -156,8 +163,11 @@ plat_dyn = false
             arch: Some("aarch64".to_string()),
             target: Some("aarch64-unknown-none-softfloat".to_string()),
             smp: None,
+            config: None,
             qemu: StarryQemuSnapshot {
-                qemu_config: Some(PathBuf::from("test-suit/starryos/smoke/qemu-riscv64.toml")),
+                qemu_config: Some(PathBuf::from(
+                    "test-suit/starryos/normal/smoke/qemu-riscv64.toml",
+                )),
             },
             uboot: StarryUbootSnapshot {
                 uboot_config: Some(PathBuf::from("configs/uboot.toml")),
@@ -170,7 +180,7 @@ plat_dyn = false
         assert_eq!(
             path,
             root.path()
-                .join("os/StarryOS/starryos/.build-riscv64gc-unknown-none-elf.toml")
+                .join("tmp/axbuild/config/starryos/build-riscv64gc-unknown-none-elf.toml")
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -184,8 +194,16 @@ plat_dyn = false
             Some("riscv64gc-unknown-none-elf")
         );
         assert_eq!(
+            snapshot.config,
+            Some(PathBuf::from(
+                "tmp/axbuild/config/starryos/build-riscv64gc-unknown-none-elf.toml"
+            ))
+        );
+        assert_eq!(
             snapshot.qemu.qemu_config,
-            Some(PathBuf::from("test-suit/starryos/smoke/qemu-riscv64.toml"))
+            Some(PathBuf::from(
+                "test-suit/starryos/normal/smoke/qemu-riscv64.toml"
+            ))
         );
         assert_eq!(
             snapshot.uboot.uboot_config,
@@ -236,6 +254,7 @@ plat_dyn = false
             arch: Some("aarch64".to_string()),
             target: Some("aarch64-unknown-none-softfloat".to_string()),
             smp: None,
+            config: None,
             qemu: StarryQemuSnapshot::default(),
             uboot: StarryUbootSnapshot::default(),
         };
@@ -261,6 +280,10 @@ plat_dyn = false
         assert_eq!(
             snapshot.target.as_deref(),
             Some("riscv64gc-unknown-none-elf")
+        );
+        assert_eq!(
+            snapshot.config,
+            Some(PathBuf::from("tmp/custom-starry.toml"))
         );
     }
 

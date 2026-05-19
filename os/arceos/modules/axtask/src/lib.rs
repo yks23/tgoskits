@@ -34,7 +34,7 @@
     test_runner(crate::bare_metal_test_runner)
 )]
 
-#[cfg(all(test, not(target_os = "none")))]
+#[cfg(all(test, not(target_os = "none"), feature = "multitask"))]
 mod tests;
 
 #[cfg(all(test, target_os = "none"))]
@@ -66,6 +66,8 @@ cfg_if::cfg_if! {
         mod run_queue;
         mod task;
         mod api;
+        #[cfg(feature = "lockdep")]
+        mod lockdep;
         mod wait_queue;
 
         #[cfg(feature = "irq")]

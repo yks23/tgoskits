@@ -1,6 +1,6 @@
 [package]
 name = "ax-std"
-version = "0.5.11"
+version = "0.5.13"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = [
@@ -51,6 +51,7 @@ tls = ["ax-feat/tls"]
 
 # Multi-threading and scheduler
 multitask = ["ax-api/multitask", "ax-feat/multitask"]
+lockdep = ["ax-feat/lockdep"]
 task-ext = ["ax-feat/task-ext"]
 sched-fifo = ["ax-feat/sched-fifo"]
 sched-rr = ["ax-feat/sched-rr"]
@@ -85,6 +86,7 @@ driver-bcm2835-sdhci = ["ax-feat/driver-bcm2835-sdhci"]
 driver-ahci = ["ax-feat/driver-ahci"]
 
 # Backtrace
+backtrace = ["ax-feat/backtrace"]
 dwarf = ["ax-feat/dwarf"]
 
 [dependencies]

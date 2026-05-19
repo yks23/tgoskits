@@ -12,10 +12,15 @@ use ax_sync::Mutex;
 use ax_task::future::{block_on, poll_io};
 use axfs_ng_vfs::{Location, Metadata, NodeFlags};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_EXCL};
 
 use super::{FileLike, Kstat, get_file_like};
-use crate::file::{IoDst, IoSrc};
+#[cfg(feature = "kcov")]
+use crate::pseudofs::DeviceMmap;
+use crate::{
+    file::{IoDst, IoSrc},
+    pseudofs::Device,
+};
 
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
     let mut fs = FS_CONTEXT.lock();
@@ -64,14 +69,21 @@ pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> AxResult<Reso
                 ResolveAtResult::Other(file_like)
             })
         }
-        Some(path) => with_fs(dirfd, |fs| {
-            if flags & AT_SYMLINK_NOFOLLOW != 0 {
-                fs.resolve_no_follow(path)
+        Some(path) => {
+            let dirfd = if path.starts_with('/') {
+                AT_FDCWD
             } else {
-                fs.resolve(path)
-            }
-            .map(ResolveAtResult::File)
-        }),
+                dirfd
+            };
+            with_fs(dirfd, |fs| {
+                if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                    fs.resolve_no_follow(path)
+                } else {
+                    fs.resolve(path)
+                }
+                .map(ResolveAtResult::File)
+            })
+        }
     }
 }
 
@@ -99,14 +111,23 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
 /// File wrapper for `ax_fs::fops::File`.
 pub struct File {
     inner: ax_fs::File,
+    open_flags: u32,
     nonblock: AtomicBool,
+    /// Per-fd kcov state, created when opening `/dev/kcov`.
+    #[cfg(feature = "kcov")]
+    kcov_state: Option<Arc<crate::kcov::KcovFdState>>,
 }
 
 impl File {
-    pub fn new(inner: ax_fs::File) -> Self {
+    pub fn new(inner: ax_fs::File, open_flags: u32) -> Self {
+        #[cfg(feature = "kcov")]
+        let kcov_state = Self::detect_kcov(&inner);
         Self {
             inner,
+            open_flags,
             nonblock: AtomicBool::new(false),
+            #[cfg(feature = "kcov")]
+            kcov_state,
         }
     }
 
@@ -114,6 +135,41 @@ impl File {
         &self.inner
     }
 
+    /// Detect if this file is backed by the kcov device and create per-fd state.
+    #[cfg(feature = "kcov")]
+    fn detect_kcov(inner: &ax_fs::File) -> Option<Arc<crate::kcov::KcovFdState>> {
+        let backend = inner.backend().ok()?;
+        let FileBackend::Direct(loc) = backend else {
+            return None;
+        };
+        let device = loc.entry().downcast::<Device>().ok()?;
+        if device
+            .inner()
+            .as_any()
+            .downcast_ref::<crate::kcov::KcovDevice>()
+            .is_some()
+        {
+            Some(Arc::new(crate::kcov::KcovFdState::new()))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        #[cfg(feature = "kcov")]
+        if let Some(ref kcov_state) = self.kcov_state {
+            kcov_state.on_close();
+        }
+
+        if let Ok(device) = self.inner.location().entry().downcast::<Device>() {
+            device.inner().close(self.open_flags & O_EXCL != 0);
+        }
+    }
+}
+
+impl File {
     fn is_blocking(&self) -> bool {
         self.inner.location().flags().contains(NodeFlags::BLOCKING)
     }
@@ -151,8 +207,25 @@ impl FileLike for File {
         Ok(metadata_to_kstat(&self.inner().location().metadata()?))
     }
 
+    fn inode_key(&self) -> Option<(u64, u64)> {
+        let m = self.inner().location().metadata().ok()?;
+        Some((m.device, m.inode))
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+        #[cfg(feature = "kcov")]
+        if let Some(ref kcov_state) = self.kcov_state {
+            return kcov_state.ioctl(cmd, arg);
+        }
         self.inner().backend()?.location().ioctl(cmd, arg)
+    }
+
+    #[cfg(feature = "kcov")]
+    fn device_mmap(&self, offset: u64) -> AxResult<DeviceMmap> {
+        if let Some(ref kcov_state) = self.kcov_state {
+            return Ok(kcov_state.mmap(offset));
+        }
+        Err(AxError::BadFileDescriptor)
     }
 
     fn file_mmap(&self) -> AxResult<(FileBackend, FileFlags)> {
@@ -168,6 +241,10 @@ impl FileLike for File {
         self.nonblock.load(Ordering::Acquire)
     }
 
+    fn open_flags(&self) -> u32 {
+        self.open_flags
+    }
+
     fn path(&self) -> Cow<'_, str> {
         path_for(self.inner.location())
     }
@@ -176,12 +253,22 @@ impl FileLike for File {
     where
         Self: Sized + 'static,
     {
-        get_file_like(fd)?.downcast_arc().map_err(|any| {
-            if any.is::<Directory>() {
-                AxError::IsADirectory
-            } else {
-                AxError::BrokenPipe
-            }
+        let any = get_file_like(fd)?;
+        if let Ok(file) = any.clone().downcast_arc::<File>() {
+            return Ok(file);
+        }
+        // Memfd wraps a regular File and is meant to behave as one for
+        // every read-data / size-changing syscall (lseek, fallocate,
+        // sendfile, pread, pwrite, ...). Hand back the inner File so
+        // those paths don't trip on the wrapper. Seal-aware ftruncate
+        // already takes a separate Memfd::from_fd branch upstream.
+        if let Ok(memfd) = any.clone().downcast_arc::<crate::file::memfd::Memfd>() {
+            return Ok(memfd.inner().clone());
+        }
+        Err(if any.is::<Directory>() {
+            AxError::IsADirectory
+        } else {
+            AxError::InvalidInput
         })
     }
 }
@@ -217,15 +304,23 @@ impl Directory {
 
 impl FileLike for Directory {
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
-        Err(AxError::BadFileDescriptor)
+        Err(AxError::IsADirectory)
     }
 
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
+        // Directories cannot be opened for writing, so any write attempt
+        // means the fd is not open for writing → EBADF.
+        // Linux VFS checks FMODE_WRITE before reaching the filesystem layer.
         Err(AxError::BadFileDescriptor)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
         Ok(metadata_to_kstat(&self.inner.metadata()?))
+    }
+
+    fn inode_key(&self) -> Option<(u64, u64)> {
+        let m = self.inner.metadata().ok()?;
+        Some((m.device, m.inode))
     }
 
     fn path(&self) -> Cow<'_, str> {

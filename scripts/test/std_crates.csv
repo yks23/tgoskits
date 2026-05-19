@@ -35,7 +35,6 @@ rsext4
 scope-local
 starry-process
 starry-signal
-smoltcp
 starry-vm
 ax-timer-list
 ax-alloc
@@ -49,6 +48,7 @@ ax-input
 ax-ipi
 ax-log
 ax-net
+ax-net-ng
 ax-runtime
 ax-feat
 ax-api
