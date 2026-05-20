@@ -86,9 +86,9 @@ fn check_null_terminated<T: PartialEq + Default>(
             // it below.
             let ptr = unsafe { start.add(len) };
             while ptr as usize >= page.as_ptr() as usize {
-                // We cannot prepare `aspace` outside of the loop, since holding
-                // aspace requires a mutex which would be required on page
-                // fault, and page faults can trigger inside the loop.
+                // Prepare only the page containing the next byte so the
+                // volatile read below does not fault while the aspace lock is
+                // not held.
 
                 // TODO: this is inefficient, but we have to do this instead of
                 // querying the page table since the page might has not been
@@ -98,15 +98,15 @@ fn check_null_terminated<T: PartialEq + Default>(
                 if unsafe { aspace_arc.raw() }.is_owned_by_current() {
                     return Err(AxError::BadAddress);
                 }
-                let aspace = aspace_arc.lock();
+                let mut aspace = aspace_arc.lock();
                 if !aspace.can_access_range(page, PAGE_SIZE_4K, access_flags) {
                     return Err(AxError::BadAddress);
                 }
+                aspace.populate_area(page, PAGE_SIZE_4K, access_flags)?;
 
                 page += PAGE_SIZE_4K;
             }
 
-            // This might trigger a page fault
             // SAFETY: The pointer is valid and points to a valid memory region.
             if unsafe { ptr.read_volatile() } == zero {
                 break;
