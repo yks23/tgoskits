@@ -305,6 +305,33 @@ pub fn check_access(start: usize, len: usize) -> VmResult {
     }
 }
 
+fn prepare_user_memory(start: usize, len: usize, access_flags: MappingFlags) -> VmResult {
+    check_access(start, len)?;
+    if len == 0 {
+        return Ok(());
+    }
+
+    let start = VirtAddr::from(start);
+    let end = start + len;
+    let page_start = start.align_down_4k();
+    let page_end = end.align_up_4k();
+
+    let curr = current();
+    let aspace_arc = curr.as_thread().proc_data.aspace();
+    if unsafe { aspace_arc.raw() }.is_owned_by_current() {
+        return Err(VmError::AccessDenied);
+    }
+
+    let mut aspace = aspace_arc.lock();
+    if !aspace.can_access_range(start, len, access_flags) {
+        return Err(VmError::AccessDenied);
+    }
+
+    aspace
+        .populate_area(page_start, page_end - page_start, access_flags)
+        .map_err(|_| VmError::AccessDenied)
+}
+
 #[extern_trait]
 unsafe impl VmIo for Vm {
     fn new() -> Self {
@@ -312,10 +339,8 @@ unsafe impl VmIo for Vm {
     }
 
     fn read(&mut self, start: usize, buf: &mut [MaybeUninit<u8>]) -> VmResult {
-        check_access(start, buf.len())?;
-        let failed_at = access_user_memory(|| unsafe {
-            user_copy(buf.as_mut_ptr() as *mut _, start as _, buf.len())
-        });
+        prepare_user_memory(start, buf.len(), MappingFlags::READ)?;
+        let failed_at = unsafe { user_copy(buf.as_mut_ptr() as *mut _, start as _, buf.len()) };
         if unlikely(failed_at != 0) {
             Err(VmError::AccessDenied)
         } else {
@@ -324,10 +349,8 @@ unsafe impl VmIo for Vm {
     }
 
     fn write(&mut self, start: usize, buf: &[u8]) -> VmResult {
-        check_access(start, buf.len())?;
-        let failed_at = access_user_memory(|| unsafe {
-            user_copy(start as _, buf.as_ptr() as *const _, buf.len())
-        });
+        prepare_user_memory(start, buf.len(), MappingFlags::WRITE)?;
+        let failed_at = unsafe { user_copy(start as _, buf.as_ptr() as *const _, buf.len()) };
         if unlikely(failed_at != 0) {
             Err(VmError::AccessDenied)
         } else {
