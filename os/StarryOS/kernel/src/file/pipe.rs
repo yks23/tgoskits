@@ -210,7 +210,8 @@ impl FileLike for Pipe {
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
         match cmd {
             FIONREAD => {
-                (arg as *mut u32).vm_write(self.shared.buffer.lock().occupied_len() as u32)?;
+                let occupied_len = self.shared.buffer.lock().occupied_len() as u32;
+                (arg as *mut u32).vm_write(occupied_len)?;
                 Ok(0)
             }
             _ => Err(AxError::NotATty),
