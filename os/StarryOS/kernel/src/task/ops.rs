@@ -395,7 +395,10 @@ pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
     let mut limit = ROBUST_LIST_LIMIT;
 
     let end_ptr = head.cast::<RobustList>() as *mut RobustList;
-    let head = head.vm_read()?;
+    let Ok(head) = head.vm_read() else {
+        debug!("robust list: failed to read head {head:?}");
+        return Ok(());
+    };
     let mut entry = head.list.next;
     let offset = head.futex_offset;
     // Bit 0 marks PI futexes in Linux's robust-list ABI.  Starry handles only
