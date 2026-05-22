@@ -1194,6 +1194,37 @@ static void test_robust_list_bad_head_is_tolerated(void)
           "bad robust-list head does not abort thread exit");
 }
 
+static void *robust_unreadable_head_owner_thread(void *arg)
+{
+    (void)arg;
+
+    long ret = raw_set_robust_list(
+        (struct local_robust_list_head *)(uintptr_t)1,
+        sizeof(struct local_robust_list_head));
+    if (ret != 0) {
+        return (void *)(intptr_t)-errno;
+    }
+    return NULL;
+}
+
+static void test_robust_list_unreadable_head_is_tolerated(void)
+{
+    printf("\n--- robust-list unreadable head pointer is tolerated ---\n");
+    pthread_t owner;
+
+    int err = pthread_create(&owner, NULL, robust_unreadable_head_owner_thread,
+                             NULL);
+    CHECK(err == 0, "pthread_create robust unreadable-head owner succeeds");
+    if (err != 0) {
+        exit(1);
+    }
+
+    void *result = NULL;
+    join_thread(owner, &result);
+    CHECK((int)(intptr_t)result == 0,
+          "unreadable robust-list head does not abort thread exit");
+}
+
 int main(void)
 {
     TEST_START("futex and robust-list syscalls");
@@ -1213,6 +1244,7 @@ int main(void)
     test_robust_list_owner_death();
     test_robust_list_pending_owner_death();
     test_robust_list_bad_head_is_tolerated();
+    test_robust_list_unreadable_head_is_tolerated();
     test_robust_list_bad_chain_does_not_hang();
 
     TEST_DONE();
